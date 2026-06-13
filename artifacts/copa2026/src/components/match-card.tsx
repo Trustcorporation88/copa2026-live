@@ -45,7 +45,7 @@ function LiveStatsRow({
         <Crosshair className="w-3 h-3" />
         <span className="tabular-nums">{s[0]}-{s[1]}</span>
       </div>
-      <div className="flex items-center gap-1" title="Escanteios">
+      <div className="flex items-center gap-1" title="Total de Chutes">
         <Flag className="w-3 h-3" />
         <span className="tabular-nums">{c[0]}-{c[1]}</span>
       </div>
