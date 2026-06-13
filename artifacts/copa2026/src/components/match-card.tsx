@@ -5,7 +5,7 @@ import { ptBR } from "date-fns/locale";
 import type { Copa2026Match } from "@workspace/api-client-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Crosshair, Flag, AlertTriangle } from "lucide-react";
+import { Crosshair, Flag } from "lucide-react";
 
 interface MatchCardProps {
   match: Copa2026Match & { theSportsDbId?: string | null };
@@ -37,20 +37,17 @@ function LiveStatsRow({
   stats?: { shotsOnGoal: [number, number]; cornerKicks: [number, number]; yellowCards: [number, number] } | null;
 }) {
   if (!stats) return null;
-  const [h, a] = [stats.shotsOnGoal, stats.cornerKicks, stats.yellowCards];
+  const s = stats.shotsOnGoal;
+  const c = stats.cornerKicks;
   return (
     <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
       <div className="flex items-center gap-1" title="Chutes a Gol">
         <Crosshair className="w-3 h-3" />
-        <span className="tabular-nums">{h[0]}-{a[0]}</span>
+        <span className="tabular-nums">{s[0]}-{s[1]}</span>
       </div>
       <div className="flex items-center gap-1" title="Escanteios">
         <Flag className="w-3 h-3" />
-        <span className="tabular-nums">{h[1]}-{a[1]}</span>
-      </div>
-      <div className="flex items-center gap-1" title="Cartões Amarelos">
-        <AlertTriangle className="w-3 h-3 text-yellow-500" />
-        <span className="tabular-nums">{h[2]}-{a[2]}</span>
+        <span className="tabular-nums">{c[0]}-{c[1]}</span>
       </div>
     </div>
   );
