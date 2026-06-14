@@ -399,7 +399,10 @@ async function fetchSdbJson<T>(path: string, timeoutMs = 10_000): Promise<T | nu
     try {
       const res = await fetchWithRetry(
         `https://www.thesportsdb.com/api/v1/json/${apiKey}/${path}`,
-        { signal: AbortSignal.timeout(timeoutMs) },
+        {
+          signal: AbortSignal.timeout(timeoutMs),
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; seligaaqui.online/1.0)" },
+        },
         2
       );
       if (!res.ok) continue;
@@ -421,6 +424,7 @@ const ESPN_TO_CANONICAL: Record<string, string> = {
 };
 
 interface EspnScoreEntry {
+  espnEventId: string | null;
   homeTeam: string;
   awayTeam: string;
   homeScore: number | null;
@@ -428,6 +432,7 @@ interface EspnScoreEntry {
   status: "PENDING" | "LIVE" | "FINISHED";
   minute: string | null;
   goalScorers: { home: string[]; away: string[] } | null;
+  liveStats: Match["liveStats"] | null;
 }
 
 async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Promise<Response> {
@@ -479,6 +484,63 @@ function goalScorersFromEspnDetails(
   return { home, away };
 }
 
+async function fetchEspnMatchStats(espnEventId: string): Promise<Match["liveStats"] | null> {
+  try {
+    const res = await fetchWithRetry(
+      `https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=${espnEventId}`,
+      {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; seligaaqui.online/1.0)" },
+        signal: AbortSignal.timeout(10_000),
+      },
+      2
+    );
+    if (!res.ok) return null;
+    const json = await res.json() as {
+      boxscore?: {
+        teams?: Array<{
+          homeAway?: string;
+          statistics?: Array<{ name?: string; displayValue?: string | number }>;
+        }>;
+      };
+    };
+    const teams = json.boxscore?.teams ?? [];
+    if (teams.length < 2) return null;
+    const home = teams.find(t => t.homeAway === "home") ?? teams[0];
+    const away = teams.find(t => t.homeAway === "away") ?? teams[1];
+    const getStat = (
+      team: (typeof teams)[number] | undefined,
+      name: string
+    ): number => {
+      const raw = team?.statistics?.find(s => s.name === name)?.displayValue;
+      if (raw == null) return 0;
+      return typeof raw === "number" ? raw : parseInt(String(raw), 10) || 0;
+    };
+    return {
+      shotsOnGoal: [getStat(home, "shotsOnTarget"), getStat(away, "shotsOnTarget")],
+      totalShots: [getStat(home, "totalShots"), getStat(away, "totalShots")],
+      cornerKicks: [getStat(home, "wonCorners"), getStat(away, "wonCorners")],
+      yellowCards: [getStat(home, "yellowCards"), getStat(away, "yellowCards")],
+    };
+  } catch (err) {
+    logger.warn({ err, espnEventId }, "ESPN match stats fetch failed");
+    return null;
+  }
+}
+
+async function enrichEspnWithStats(map: Map<string, EspnScoreEntry>): Promise<void> {
+  const targets = [...map.values()].filter(
+    e => e.espnEventId && (e.status === "LIVE" || e.status === "FINISHED") && !e.liveStats
+  );
+  if (targets.length === 0) return;
+  const results = await mapPool(targets, async entry => ({
+    entry,
+    stats: await fetchEspnMatchStats(entry.espnEventId!),
+  }), 4);
+  for (const { entry, stats } of results) {
+    if (stats) entry.liveStats = stats;
+  }
+}
+
 async function fetchEspnScoresForDates(dates: string[]): Promise<Map<string, EspnScoreEntry>> {
   const map = new Map<string, EspnScoreEntry>();
   const unique = [...new Set(dates.map(d => d.replace(/-/g, "")))];
@@ -494,6 +556,7 @@ async function fetchEspnScoresForDates(dates: string[]): Promise<Map<string, Esp
       if (!r.ok) return [] as EspnScoreEntry[];
       const json = await r.json() as {
         events?: Array<{
+          id?: string;
           competitions?: Array<{
             status?: { displayClock?: string; type?: { name?: string; state?: string } };
             competitors?: Array<{ homeAway?: string; score?: string; team?: { id?: string; displayName?: string } }>;
@@ -528,6 +591,7 @@ async function fetchEspnScoresForDates(dates: string[]): Promise<Map<string, Esp
           : null;
         const hasGoals = goalScorers && (goalScorers.home.length > 0 || goalScorers.away.length > 0);
         entries.push({
+          espnEventId: ev.id ?? null,
           homeTeam: homeCanon,
           awayTeam: awayCanon,
           homeScore: hs,
@@ -535,6 +599,7 @@ async function fetchEspnScoresForDates(dates: string[]): Promise<Map<string, Esp
           status,
           minute: status === "LIVE" ? (comp.status?.displayClock ?? null) : null,
           goalScorers: hasGoals ? goalScorers : null,
+          liveStats: null,
         });
       }
       return entries;
@@ -549,6 +614,7 @@ async function fetchEspnScoresForDates(dates: string[]): Promise<Map<string, Esp
       map.set(sdbEventKey(e.homeTeam, e.awayTeam), e);
     }
   }
+  await enrichEspnWithStats(map);
   return map;
 }
 
@@ -1019,7 +1085,7 @@ async function buildSdbOnlyMatches(
         ...m,
         goalScorers,
         liveStats: m.status === "LIVE" || m.status === "FINISHED"
-          ? statsById.get(m.theSportsDbId ?? "") ?? null
+          ? statsById.get(m.theSportsDbId ?? "") ?? m.liveStats ?? null
           : null,
       };
     });
@@ -1223,7 +1289,9 @@ async function buildAllMatches(): Promise<{
         thumbnail: sdbEv?.strThumb ?? null,
         minute: status === "LIVE" ? (espnEv?.minute ?? extractMinute(sdbEv, detail)) : null,
         goalScorers: hasGoalData ? { home: homeGoals, away: awayGoals } : null,
-        liveStats: (status === "LIVE" || status === "FINISHED") ? (liveStatsMap.get(theSportsDbId ?? "") ?? null) : null,
+        liveStats: (status === "LIVE" || status === "FINISHED")
+          ? (liveStatsMap.get(theSportsDbId ?? "") ?? espnEv?.liveStats ?? null)
+          : null,
       };
     });
 
