@@ -313,7 +313,9 @@ interface MainCache {
   expiresAt: number;
 }
 let mainCache: MainCache | null = null;
+let staleMainCache: MainCache | null = null;
 const MAIN_TTL = 55_000;
+const STALE_TTL = 1_800_000; // 30 min — last good payload when live fetch fails
 
 interface StatsCache {
   data: unknown;
@@ -390,6 +392,43 @@ interface BracketMatch {
 
 // ─── Data fetching ──────────────────────────────────────────────────────────
 
+async function mapPool<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R>,
+  concurrency = 6
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      results[idx] = await fn(items[idx]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function persistMainCache(matches: Match[], source: "live" | "cache" | "static"): void {
+  if (matches.length === 0) return;
+  const now = Date.now();
+  const data = { matches, updatedAt: new Date().toISOString(), source };
+  mainCache = { data, expiresAt: now + MAIN_TTL };
+  staleMainCache = { data, expiresAt: now + STALE_TTL };
+}
+
+function getStaleScoresResponse(): { matches: Match[]; updatedAt: string; source: "cache" } | null {
+  const now = Date.now();
+  if (staleMainCache && now < staleMainCache.expiresAt && staleMainCache.data.matches.length > 0) {
+    return { ...staleMainCache.data, source: "cache" };
+  }
+  if (mainCache && mainCache.data.matches.length > 0) {
+    return { ...mainCache.data, source: "cache" };
+  }
+  return null;
+}
+
 async function fetchFdFixtures(allStages = false): Promise<FdMatch[]> {
   const key = process.env.FOOTBALL_DATA_API_KEY ?? "";
   if (!key) throw new Error("FOOTBALL_DATA_API_KEY not set");
@@ -401,6 +440,16 @@ async function fetchFdFixtures(allStages = false): Promise<FdMatch[]> {
   const json = await res.json() as { matches?: FdMatch[] };
   if (allStages) return json.matches ?? [];
   return (json.matches ?? []).filter(m => m.stage === "GROUP_STAGE");
+}
+
+async function fetchFdFixturesSafe(allStages = false): Promise<FdMatch[] | null> {
+  try {
+    const matches = await fetchFdFixtures(allStages);
+    return matches.length > 0 ? matches : null;
+  } catch (err) {
+    logger.warn({ err }, "FD fixtures fetch failed");
+    return null;
+  }
 }
 
 async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
@@ -417,6 +466,25 @@ async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
     }
   }
   return map;
+}
+
+async function fetchSdbScoresSafe(): Promise<Map<string, SdbEvent>> {
+  try {
+    return await fetchSdbScores();
+  } catch (err) {
+    logger.warn({ err }, "SDB season fetch failed");
+    return new Map();
+  }
+}
+
+async function enrichSdbMapSafe(map: Map<string, SdbEvent>, fdMatches: FdMatch[]): Promise<void> {
+  try {
+    const fixtureDates = fdMatches.map(m => (m.utcDate ?? "").slice(0, 10));
+    await supplementSdbMap(map, fixtureDates);
+    await resolveMissingSdbEvents(map, fdMatches);
+  } catch (err) {
+    logger.warn({ err }, "SDB map enrichment failed — continuing with partial data");
+  }
 }
 
 /** Season bulk feed is often incomplete — merge per-day World Cup events. */
@@ -655,12 +723,22 @@ async function mergeStats(
   };
 }
 
-async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "static" }> {
+async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "cache" | "static" }> {
+  const stale = getStaleScoresResponse();
   try {
-    const [fdMatches, sdbMap] = await Promise.all([fetchFdFixtures(), fetchSdbScores()]);
-    const fixtureDates = fdMatches.map(m => (m.utcDate ?? "").slice(0, 10));
-    await supplementSdbMap(sdbMap, fixtureDates);
-    await resolveMissingSdbEvents(sdbMap, fdMatches);
+    const [fdMatches, sdbMap] = await Promise.all([
+      fetchFdFixturesSafe(),
+      fetchSdbScoresSafe(),
+    ]);
+
+    if (!fdMatches || fdMatches.length === 0) {
+      const sdbOnly = await buildSdbOnlyMatches(sdbMap);
+      if (sdbOnly.length > 0) return { matches: sdbOnly, source: "live" };
+      if (stale) return { matches: stale.matches, source: "cache" };
+      return { matches: [], source: "static" };
+    }
+
+    await enrichSdbMapSafe(sdbMap, fdMatches);
 
     const initialMatches = fdMatches.map((fdm, idx) => {
       const homeEn = fdm.homeTeam.name ?? "";
@@ -703,69 +781,68 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
     const timelineGoalsMap = new Map<string, { home: string[]; away: string[] }>();
     const liveStatsMap = new Map<string, Match["liveStats"]>();
 
-    // Fetch live details (short TTL) and finished-match enrichment (long TTL) in parallel
-    const [liveDetailResults, finishedDetailResults, timelineResults] = await Promise.all([
-      liveMatches.length > 0
-        ? Promise.all(
-            liveMatches.map(m =>
-              fetchLiveEventDetail(m.theSportsDbId!, LIVE_DETAIL_TTL).then(d => ({ id: m.theSportsDbId!, detail: d }))
-            )
-          )
-        : Promise.resolve([] as { id: string; detail: SdbEventDetail | null }[]),
-      finishedMissingScorers.length > 0
-        ? Promise.all(
-            finishedMissingScorers.map(m =>
-              fetchLiveEventDetail(m.theSportsDbId!, FINISHED_DETAIL_TTL).then(d => ({ id: m.theSportsDbId!, detail: d }))
-            )
-          )
-        : Promise.resolve([] as { id: string; detail: SdbEventDetail | null }[]),
-      matchesNeedingGoalEnrichment.length > 0
-        ? Promise.all(
-            matchesNeedingGoalEnrichment.map(m =>
-              fetchSdbTimeline(m.theSportsDbId!, m.status === "LIVE" ? LIVE_DETAIL_TTL : FINISHED_DETAIL_TTL).then(timeline => ({
-                id: m.theSportsDbId!,
-                goals: goalScorersFromTimeline(timeline),
-              }))
-            )
-          )
-        : Promise.resolve([] as { id: string; goals: { home: string[]; away: string[] } }[]),
-    ]);
+    try {
+      const [liveDetailResults, finishedDetailResults, timelineResults] = await Promise.all([
+        liveMatches.length > 0
+          ? mapPool(liveMatches, async m => ({
+              id: m.theSportsDbId!,
+              detail: await fetchLiveEventDetail(m.theSportsDbId!, LIVE_DETAIL_TTL),
+            }), 6)
+          : Promise.resolve([] as { id: string; detail: SdbEventDetail | null }[]),
+        finishedMissingScorers.length > 0
+          ? mapPool(finishedMissingScorers, async m => ({
+              id: m.theSportsDbId!,
+              detail: await fetchLiveEventDetail(m.theSportsDbId!, FINISHED_DETAIL_TTL),
+            }), 6)
+          : Promise.resolve([] as { id: string; detail: SdbEventDetail | null }[]),
+        matchesNeedingGoalEnrichment.length > 0
+          ? mapPool(matchesNeedingGoalEnrichment, async m => ({
+              id: m.theSportsDbId!,
+              goals: goalScorersFromTimeline(
+                await fetchSdbTimeline(m.theSportsDbId!, m.status === "LIVE" ? LIVE_DETAIL_TTL : FINISHED_DETAIL_TTL)
+              ),
+            }), 6)
+          : Promise.resolve([] as { id: string; goals: { home: string[]; away: string[] } }[]),
+      ]);
 
-    for (const { id, detail } of liveDetailResults) liveDetails.set(id, detail);
-    for (const { id, detail } of finishedDetailResults) liveDetails.set(id, detail);
-    for (const { id, goals } of timelineResults) {
-      if (goals.home.length > 0 || goals.away.length > 0) timelineGoalsMap.set(id, goals);
-    }
-
-    // Fetch stats from TheSportsDB in parallel (fast, no API key needed)
-    if (statsMatches.length > 0) {
-      const sdbStatsResults = await Promise.all(
-        statsMatches.map(async (m) => ({
-          id: m.theSportsDbId!,
-          stats: await fetchSdbStatsOnly(m.theSportsDbId!),
-        }))
-      );
-      for (const r of sdbStatsResults) {
-        if (r.stats) liveStatsMap.set(r.id, r.stats);
+      for (const { id, detail } of liveDetailResults) liveDetails.set(id, detail);
+      for (const { id, detail } of finishedDetailResults) liveDetails.set(id, detail);
+      for (const { id, goals } of timelineResults) {
+        if (goals.home.length > 0 || goals.away.length > 0) timelineGoalsMap.set(id, goals);
       }
 
-      // Enrich live matches with api-sports corners/cards when key is available
-      const afKey = process.env.API_FOOTBALL_KEY ?? "";
-      if (afKey) {
-        for (const m of statsMatches.filter((x) => x.status === "LIVE")) {
-          const afId = await fetchSdbApiFootballId(m.theSportsDbId!);
-          if (!afId) continue;
-          const afStats = await fetchLiveStatsOnly(afId, afKey);
-          const existing = liveStatsMap.get(m.theSportsDbId!);
-          if (existing && afStats) {
-            liveStatsMap.set(m.theSportsDbId!, {
-              ...existing,
-              cornerKicks: afStats.cornerKicks,
-              yellowCards: afStats.yellowCards,
-            });
+      if (statsMatches.length > 0) {
+        const sdbStatsResults = await mapPool(
+          statsMatches,
+          async m => ({ id: m.theSportsDbId!, stats: await fetchSdbStatsOnly(m.theSportsDbId!) }),
+          6
+        );
+        for (const r of sdbStatsResults) {
+          if (r.stats) liveStatsMap.set(r.id, r.stats);
+        }
+
+        const afKey = process.env.API_FOOTBALL_KEY ?? "";
+        if (afKey) {
+          const liveWithAf = statsMatches.filter(x => x.status === "LIVE").slice(0, 6);
+          for (const m of liveWithAf) {
+            try {
+              const afId = await fetchSdbApiFootballId(m.theSportsDbId!);
+              if (!afId) continue;
+              const afStats = await fetchLiveStatsOnly(afId, afKey);
+              const existing = liveStatsMap.get(m.theSportsDbId!);
+              if (existing && afStats) {
+                liveStatsMap.set(m.theSportsDbId!, {
+                  ...existing,
+                  cornerKicks: afStats.cornerKicks,
+                  yellowCards: afStats.yellowCards,
+                });
+              }
+            } catch { /* non-fatal */ }
           }
         }
       }
+    } catch (err) {
+      logger.warn({ err }, "Match enrichment failed — returning base scores");
     }
 
     const matches: Match[] = initialMatches.map(({ idx, sdbEv, homeEn, awayEn, rawHs, rawAs, status, theSportsDbId, fdm }) => {
