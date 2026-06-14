@@ -1776,7 +1776,7 @@ router.get("/copa2026/match/:eventId/stats", async (req, res) => {
     }
 
     const lineup = {
-      home: (lineupJson.lineup ?? [])
+      home: (lineupJson?.lineup ?? [])
         .filter(p => p.strHome === "Yes")
         .map(p => ({
           name: p.strPlayer,
@@ -1785,7 +1785,7 @@ router.get("/copa2026/match/:eventId/stats", async (req, res) => {
           isSub: p.strSubstitute === "Yes",
         }))
         .sort((a, b) => (a.isSub ? 1 : 0) - (b.isSub ? 1 : 0)),
-      away: (lineupJson.lineup ?? [])
+      away: (lineupJson?.lineup ?? [])
         .filter(p => p.strHome !== "Yes")
         .map(p => ({
           name: p.strPlayer,
