@@ -1046,7 +1046,7 @@ async function buildSdbOnlyMatches(
       thumbnail: ev.strThumb ?? null,
       minute: status === "LIVE" ? (espnEv?.minute ?? extractMinute(ev, null)) : null,
       goalScorers: goalScorers && (goalScorers.home.length > 0 || goalScorers.away.length > 0) ? goalScorers : null,
-      liveStats: null,
+      liveStats: espnEv?.liveStats ?? null,
     };
   });
 
