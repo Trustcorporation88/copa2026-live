@@ -173,6 +173,59 @@ function parsePlayerNameFromGoalDetail(detail: string): string {
   return detail.trim().replace(/\s+\d+(?:\+\d+)?['′]?\s*$/, "");
 }
 
+interface SdbTimelineEntry {
+  strTimeline: string;
+  strTimelineDetail?: string | null;
+  strHome: string;
+  strPlayer: string;
+  strAssist?: string | null;
+  intTime: string;
+  strTeam: string;
+}
+
+interface TimelineCache {
+  data: SdbTimelineEntry[];
+  expiresAt: number;
+}
+const timelineCacheMap = new Map<string, TimelineCache>();
+const TIMELINE_TTL = 3_600_000;
+
+async function fetchSdbTimeline(eventId: string, ttl = TIMELINE_TTL): Promise<SdbTimelineEntry[]> {
+  const now = Date.now();
+  const cached = timelineCacheMap.get(eventId);
+  if (cached && now < cached.expiresAt) return cached.data;
+
+  try {
+    const res = await fetch(
+      `https://www.thesportsdb.com/api/v1/json/3/lookuptimeline.php?id=${eventId}`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (!res.ok) return [];
+    const json = await res.json() as { timeline?: SdbTimelineEntry[] };
+    const timeline = json.timeline ?? [];
+    timelineCacheMap.set(eventId, { data: timeline, expiresAt: now + ttl });
+    return timeline;
+  } catch {
+    return [];
+  }
+}
+
+function goalScorersFromTimeline(timeline: SdbTimelineEntry[]): { home: string[]; away: string[] } {
+  const home: string[] = [];
+  const away: string[] = [];
+  for (const e of timeline) {
+    if (e.strTimeline !== "Goal") continue;
+    if (e.strTimelineDetail === "Own Goal") continue;
+    const player = e.strPlayer?.trim();
+    if (!player) continue;
+    const minute = e.intTime ? `${e.intTime}'` : "";
+    const detail = minute ? `${player} ${minute}` : player;
+    if (e.strHome === "Yes") home.push(detail);
+    else away.push(detail);
+  }
+  return { home, away };
+}
+
 function buildTopScorersFromMatches(matches: Match[]): TopScorer[] {
   const playerMap = new Map<string, { team: string; teamFlag: string; goals: number }>();
 
@@ -519,21 +572,20 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
 
     const liveMatches = initialMatches.filter(m => m.status === "LIVE" && m.theSportsDbId);
     const statsMatches = initialMatches.filter(m => (m.status === "LIVE" || m.status === "FINISHED") && m.theSportsDbId);
-    // Finished matches that have no (or incomplete) goal scorer data in the bulk
-    // season endpoint — fetch lookupevent.php for them so cards show scorers
-    // without opening details. Copa 2026 is a bounded tournament (~80 matches
-    // total), so no cap is needed; finished detail is cached for 1 hour.
-    const finishedMissingScorers = initialMatches
-      .filter(m =>
-        m.status === "FINISHED" &&
-        m.theSportsDbId &&
-        (!m.sdbEv?.strHomeGoalDetails || !m.sdbEv?.strAwayGoalDetails)
-      );
+    // Finished/live matches without goal scorer strings in the bulk season feed —
+    // enrich via lookupevent (minute/progress) and lookuptimeline (goals).
+    const matchesNeedingGoalEnrichment = initialMatches.filter(m =>
+      (m.status === "FINISHED" || m.status === "LIVE") &&
+      m.theSportsDbId &&
+      (!m.sdbEv?.strHomeGoalDetails && !m.sdbEv?.strAwayGoalDetails)
+    );
+    const finishedMissingScorers = matchesNeedingGoalEnrichment.filter(m => m.status === "FINISHED");
     const liveDetails = new Map<string, SdbEventDetail | null>();
+    const timelineGoalsMap = new Map<string, { home: string[]; away: string[] }>();
     const liveStatsMap = new Map<string, Match["liveStats"]>();
 
     // Fetch live details (short TTL) and finished-match enrichment (long TTL) in parallel
-    const [liveDetailResults, finishedDetailResults] = await Promise.all([
+    const [liveDetailResults, finishedDetailResults, timelineResults] = await Promise.all([
       liveMatches.length > 0
         ? Promise.all(
             liveMatches.map(m =>
@@ -548,10 +600,23 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
             )
           )
         : Promise.resolve([] as { id: string; detail: SdbEventDetail | null }[]),
+      matchesNeedingGoalEnrichment.length > 0
+        ? Promise.all(
+            matchesNeedingGoalEnrichment.map(m =>
+              fetchSdbTimeline(m.theSportsDbId!, m.status === "LIVE" ? LIVE_DETAIL_TTL : FINISHED_DETAIL_TTL).then(timeline => ({
+                id: m.theSportsDbId!,
+                goals: goalScorersFromTimeline(timeline),
+              }))
+            )
+          )
+        : Promise.resolve([] as { id: string; goals: { home: string[]; away: string[] } }[]),
     ]);
 
     for (const { id, detail } of liveDetailResults) liveDetails.set(id, detail);
     for (const { id, detail } of finishedDetailResults) liveDetails.set(id, detail);
+    for (const { id, goals } of timelineResults) {
+      if (goals.home.length > 0 || goals.away.length > 0) timelineGoalsMap.set(id, goals);
+    }
 
     // Fetch stats from TheSportsDB in parallel (fast, no API key needed)
     if (statsMatches.length > 0) {
@@ -588,8 +653,15 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
       const detail = theSportsDbId ? (liveDetails.get(theSportsDbId) ?? null) : null;
       const goalHomeDetails = detail?.strHomeGoalDetails ?? sdbEv?.strHomeGoalDetails;
       const goalAwayDetails = detail?.strAwayGoalDetails ?? sdbEv?.strAwayGoalDetails;
-      const homeGoals = parseGoalScorers(goalHomeDetails);
-      const awayGoals = parseGoalScorers(goalAwayDetails);
+      let homeGoals = parseGoalScorers(goalHomeDetails);
+      let awayGoals = parseGoalScorers(goalAwayDetails);
+      if (homeGoals.length === 0 && awayGoals.length === 0 && theSportsDbId) {
+        const fromTimeline = timelineGoalsMap.get(theSportsDbId);
+        if (fromTimeline) {
+          homeGoals = fromTimeline.home;
+          awayGoals = fromTimeline.away;
+        }
+      }
       const hasGoalData = homeGoals.length > 0 || awayGoals.length > 0;
 
       return {
@@ -655,21 +727,45 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
       const statsMatches = matchesBase.filter(
         (m) => (m.status === "LIVE" || m.status === "FINISHED") && m.theSportsDbId
       );
-      const statsResults = await Promise.all(
-        statsMatches.map(async (m) => ({
-          id: m.theSportsDbId!,
-          stats: await fetchSdbStatsOnly(m.theSportsDbId!),
-        }))
-      );
+      const [statsResults, fallbackTimelineResults] = await Promise.all([
+        Promise.all(
+          statsMatches.map(async (m) => ({
+            id: m.theSportsDbId!,
+            stats: await fetchSdbStatsOnly(m.theSportsDbId!),
+          }))
+        ),
+        Promise.all(
+          matchesBase
+            .filter(m => (m.status === "FINISHED" || m.status === "LIVE") && m.theSportsDbId && !m.goalScorers)
+            .map(async m => ({
+              id: m.theSportsDbId!,
+              goals: goalScorersFromTimeline(await fetchSdbTimeline(m.theSportsDbId!)),
+            }))
+        ),
+      ]);
       const statsById = new Map(statsResults.filter((r) => r.stats).map((r) => [r.id, r.stats!]));
+      const fallbackGoalsById = new Map(
+        fallbackTimelineResults
+          .filter(r => r.goals.home.length > 0 || r.goals.away.length > 0)
+          .map(r => [r.id, r.goals])
+      );
 
-      const matches = matchesBase.map((m) => ({
-        ...m,
-        liveStats:
-          m.status === "LIVE" || m.status === "FINISHED"
-            ? statsById.get(m.theSportsDbId ?? "") ?? null
-            : null,
-      }));
+      const matches = matchesBase.map((m) => {
+        const fromTimeline = m.theSportsDbId ? fallbackGoalsById.get(m.theSportsDbId) : undefined;
+        const goalScorers = m.goalScorers ?? (
+          fromTimeline && (fromTimeline.home.length > 0 || fromTimeline.away.length > 0)
+            ? fromTimeline
+            : null
+        );
+        return {
+          ...m,
+          goalScorers,
+          liveStats:
+            m.status === "LIVE" || m.status === "FINISHED"
+              ? statsById.get(m.theSportsDbId ?? "") ?? null
+              : null,
+        };
+      });
 
       return { matches, source: "live" };
     } catch (err2) {
@@ -831,6 +927,48 @@ const AF_TO_FLAG: Record<string, string> = {
 function afTeamPt(name: string): string { return AF_TO_PT[name] ?? PT_NAME[name] ?? name; }
 function afTeamFlag(name: string): string { return AF_TO_FLAG[name] ?? FLAG[name] ?? "🏳️"; }
 
+async function buildTopScorersFromSdbTimelines(matches: Match[]): Promise<TopScorer[]> {
+  const relevant = matches.filter(
+    m => (m.status === "FINISHED" || m.status === "LIVE") && m.theSportsDbId
+  );
+  const timelines = await Promise.all(
+    relevant.map(m => fetchSdbTimeline(m.theSportsDbId!).then(t => ({ match: m, timeline: t })))
+  );
+
+  const playerMap = new Map<string, { team: string; teamFlag: string; goals: number; assists: number }>();
+  for (const { timeline } of timelines) {
+    for (const e of timeline) {
+      if (e.strTimeline !== "Goal" || e.strTimelineDetail === "Own Goal") continue;
+      const name = e.strPlayer?.trim();
+      if (!name) continue;
+      const team = afTeamPt(e.strTeam);
+      const flag = afTeamFlag(e.strTeam);
+      const assist = e.strAssist?.trim() && e.strAssist !== "0" ? e.strAssist.trim() : null;
+      const existing = playerMap.get(name);
+      if (existing) {
+        existing.goals++;
+        if (assist) existing.assists++;
+      } else {
+        playerMap.set(name, { team, teamFlag: flag, goals: 1, assists: assist ? 1 : 0 });
+      }
+    }
+  }
+
+  return [...playerMap.entries()]
+    .map(([player, info]) => ({
+      rank: 0,
+      player,
+      photo: null,
+      team: info.team,
+      teamFlag: info.teamFlag,
+      goals: info.goals,
+      assists: info.assists,
+      appearances: 0,
+    }))
+    .sort((a, b) => b.goals - a.goals || b.assists - a.assists || a.player.localeCompare(b.player))
+    .map((s, i) => ({ ...s, rank: i + 1 }));
+}
+
 router.get("/copa2026/topscorers", async (_req, res) => {
   const now = Date.now();
   if (topScorersCache && now < topScorersCache.expiresAt) {
@@ -904,7 +1042,12 @@ router.get("/copa2026/topscorers", async (_req, res) => {
       .sort((a, b) => b.goals - a.goals || a.player.localeCompare(b.player))
       .map((s, i) => ({ ...s, rank: i + 1 }));
 
-    const finalScorers = scorers.length > 0 ? scorers : buildTopScorersFromMatches(matches);
+    const fromMatches = buildTopScorersFromMatches(matches);
+    const finalScorers = scorers.length > 0
+      ? scorers
+      : fromMatches.length > 0
+        ? fromMatches
+        : await buildTopScorersFromSdbTimelines(matches);
 
     topScorersCache = { data: finalScorers, expiresAt: now + TOPSCORERS_TTL };
     res.json(finalScorers);
@@ -912,7 +1055,8 @@ router.get("/copa2026/topscorers", async (_req, res) => {
     logger.warn({ err }, "top scorers fetch failed");
     try {
       const result = await buildAllMatches();
-      res.json(buildTopScorersFromMatches(result.matches));
+      const fromMatches = buildTopScorersFromMatches(result.matches);
+      res.json(fromMatches.length > 0 ? fromMatches : await buildTopScorersFromSdbTimelines(result.matches));
     } catch {
       res.json([]);
     }
