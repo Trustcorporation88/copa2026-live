@@ -179,6 +179,7 @@ interface SdbTimelineEntry {
   strHome: string;
   strPlayer: string;
   strAssist?: string | null;
+  strCutout?: string | null;
   intTime: string;
   strTeam: string;
 }
@@ -935,7 +936,7 @@ async function buildTopScorersFromSdbTimelines(matches: Match[]): Promise<TopSco
     relevant.map(m => fetchSdbTimeline(m.theSportsDbId!).then(t => ({ match: m, timeline: t })))
   );
 
-  const playerMap = new Map<string, { team: string; teamFlag: string; goals: number; assists: number }>();
+  const playerMap = new Map<string, { team: string; teamFlag: string; goals: number; assists: number; photo: string | null }>();
   for (const { timeline } of timelines) {
     for (const e of timeline) {
       if (e.strTimeline !== "Goal" || e.strTimelineDetail === "Own Goal") continue;
@@ -943,13 +944,15 @@ async function buildTopScorersFromSdbTimelines(matches: Match[]): Promise<TopSco
       if (!name) continue;
       const team = afTeamPt(e.strTeam);
       const flag = afTeamFlag(e.strTeam);
+      const photo = e.strCutout?.trim() || null;
       const assist = e.strAssist?.trim() && e.strAssist !== "0" ? e.strAssist.trim() : null;
       const existing = playerMap.get(name);
       if (existing) {
         existing.goals++;
         if (assist) existing.assists++;
+        if (!existing.photo && photo) existing.photo = photo;
       } else {
-        playerMap.set(name, { team, teamFlag: flag, goals: 1, assists: assist ? 1 : 0 });
+        playerMap.set(name, { team, teamFlag: flag, goals: 1, assists: assist ? 1 : 0, photo });
       }
     }
   }
@@ -958,7 +961,7 @@ async function buildTopScorersFromSdbTimelines(matches: Match[]): Promise<TopSco
     .map(([player, info]) => ({
       rank: 0,
       player,
-      photo: null,
+      photo: info.photo,
       team: info.team,
       teamFlag: info.teamFlag,
       goals: info.goals,
@@ -1042,12 +1045,12 @@ router.get("/copa2026/topscorers", async (_req, res) => {
       .sort((a, b) => b.goals - a.goals || a.player.localeCompare(b.player))
       .map((s, i) => ({ ...s, rank: i + 1 }));
 
-    const fromMatches = buildTopScorersFromMatches(matches);
+    const timelineScorers = await buildTopScorersFromSdbTimelines(matches);
     const finalScorers = scorers.length > 0
       ? scorers
-      : fromMatches.length > 0
-        ? fromMatches
-        : await buildTopScorersFromSdbTimelines(matches);
+      : timelineScorers.length > 0
+        ? timelineScorers
+        : buildTopScorersFromMatches(matches);
 
     topScorersCache = { data: finalScorers, expiresAt: now + TOPSCORERS_TTL };
     res.json(finalScorers);
@@ -1055,8 +1058,8 @@ router.get("/copa2026/topscorers", async (_req, res) => {
     logger.warn({ err }, "top scorers fetch failed");
     try {
       const result = await buildAllMatches();
-      const fromMatches = buildTopScorersFromMatches(result.matches);
-      res.json(fromMatches.length > 0 ? fromMatches : await buildTopScorersFromSdbTimelines(result.matches));
+      const timelineScorers = await buildTopScorersFromSdbTimelines(result.matches);
+      res.json(timelineScorers.length > 0 ? timelineScorers : buildTopScorersFromMatches(result.matches));
     } catch {
       res.json([]);
     }

@@ -5,7 +5,7 @@ import { ptBR } from "date-fns/locale";
 import type { Copa2026Match } from "@workspace/api-client-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Crosshair, Target } from "lucide-react";
+import { Crosshair, Target, Flag, Square } from "lucide-react";
 
 interface MatchCardProps {
   match: Copa2026Match & { theSportsDbId?: string | null };
@@ -31,6 +31,21 @@ function useScoreFlash(score: number | null) {
   return flashKey;
 }
 
+function TeamBadge({ badge, flag, name }: { badge?: string | null; flag: string; name: string }) {
+  const [err, setErr] = useState(false);
+  if (badge && !err) {
+    return (
+      <img
+        src={badge}
+        alt=""
+        className="w-6 h-6 object-contain shrink-0"
+        onError={() => setErr(true)}
+      />
+    );
+  }
+  return <span className="text-xl shrink-0" aria-hidden="true">{flag}</span>;
+}
+
 function LiveStatsRow({
   stats,
 }: {
@@ -44,16 +59,33 @@ function LiveStatsRow({
   if (!stats) return null;
   const onTarget = stats.shotsOnGoal;
   const total = stats.totalShots ?? stats.shotsOnGoal;
+  const corners = stats.cornerKicks;
+  const cards = stats.yellowCards;
+  const hasCorners = corners[0] > 0 || corners[1] > 0;
+  const hasCards = cards[0] > 0 || cards[1] > 0;
+
   return (
-    <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
       <div className="flex items-center gap-1" title="Chutes a Gol">
-        <Crosshair className="w-3 h-3" />
-        <span className="tabular-nums">{onTarget[0]}-{onTarget[1]}</span>
+        <Crosshair className="w-3 h-3 text-primary/70" />
+        <span className="tabular-nums font-medium">{onTarget[0]}-{onTarget[1]}</span>
       </div>
       <div className="flex items-center gap-1" title="Total de Chutes">
-        <Target className="w-3 h-3" />
-        <span className="tabular-nums">{total[0]}-{total[1]}</span>
+        <Target className="w-3 h-3 text-primary/70" />
+        <span className="tabular-nums font-medium">{total[0]}-{total[1]}</span>
       </div>
+      {hasCorners && (
+        <div className="flex items-center gap-1" title="Escanteios">
+          <Flag className="w-3 h-3 text-sky-400/80" />
+          <span className="tabular-nums font-medium">{corners[0]}-{corners[1]}</span>
+        </div>
+      )}
+      {hasCards && (
+        <div className="flex items-center gap-1" title="Cartões Amarelos">
+          <Square className="w-3 h-3 text-yellow-400 fill-yellow-400/80" />
+          <span className="tabular-nums font-medium">{cards[0]}-{cards[1]}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -81,7 +113,8 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
         className="w-full h-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-xl"
         aria-label={`${match.homeTeam.name} vs ${match.awayTeam.name} — ver detalhes`}
       >
-        <Card className="h-full border-border bg-card hover:border-primary/60 hover:shadow-[0_0_20px_rgba(255,215,0,0.12)] active:scale-[0.98] transition-all duration-200 relative overflow-hidden group cursor-pointer">
+        <Card className={`h-full border bg-card hover:border-primary/60 hover:shadow-[0_0_20px_rgba(255,215,0,0.12)] active:scale-[0.98] transition-all duration-200 relative overflow-hidden group cursor-pointer
+          ${isLive ? "border-red-500/50 shadow-[0_0_24px_rgba(239,68,68,0.12)]" : "border-border"}`}>
           <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none" />
 
           <CardContent className="p-4 flex flex-col h-full">
@@ -111,7 +144,7 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
             <div className="flex-1 flex flex-col justify-center space-y-2.5 mb-3">
               <div className="flex justify-between items-center gap-2">
                 <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-xl shrink-0" aria-hidden="true">{match.homeTeam.flag}</span>
+                  <TeamBadge badge={(match.homeTeam as { badge?: string | null }).badge} flag={match.homeTeam.flag} name={match.homeTeam.name} />
                   <span className="font-semibold text-sm sm:text-base leading-tight truncate">{match.homeTeam.name}</span>
                 </div>
                 <AnimatePresence mode="popLayout">
@@ -139,7 +172,7 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
 
               <div className="flex justify-between items-center gap-2">
                 <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-xl shrink-0" aria-hidden="true">{match.awayTeam.flag}</span>
+                  <TeamBadge badge={(match.awayTeam as { badge?: string | null }).badge} flag={match.awayTeam.flag} name={match.awayTeam.name} />
                   <span className="font-semibold text-sm sm:text-base leading-tight truncate">{match.awayTeam.name}</span>
                 </div>
                 <AnimatePresence mode="popLayout">

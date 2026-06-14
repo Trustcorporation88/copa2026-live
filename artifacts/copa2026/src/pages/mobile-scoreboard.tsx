@@ -1,15 +1,25 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import { format, parseISO } from "date-fns";
+import { format, parseISO, formatDistanceToNow } from "date-fns";
 import { ptBR } from "date-fns/locale";
-import { Trophy, RefreshCw, WifiOff, Circle, MapPin, X, Clock, Hash, Users } from "lucide-react";
+import { Trophy, RefreshCw, WifiOff, Circle, MapPin, X, Clock, Hash, Users, LayoutGrid, Target } from "lucide-react";
 import {
   useGetCopa2026Scores,
   getGetCopa2026ScoresQueryKey,
 } from "@workspace/api-client-react";
 import type { Copa2026Match, Copa2026ScoresResponse } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { GroupStandings } from "@/components/group-standings";
+import { TopScorers } from "@/components/top-scorers";
 
 const GROUPS = ["Todos", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"];
+
+type Tab = "placares" | "grupos" | "artilheiros";
+
+const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
+  { id: "placares", label: "Jogos", icon: <Trophy size={18} /> },
+  { id: "grupos", label: "Grupos", icon: <LayoutGrid size={18} /> },
+  { id: "artilheiros", label: "Gols", icon: <Target size={18} /> },
+];
 
 const C = {
   bg:      "#060e1c",
@@ -36,6 +46,7 @@ type ExtendedMatch = Copa2026Match & {
 };
 
 export default function MobileScoreboard() {
+  const [activeTab, setActiveTab] = useState<Tab>("placares");
   const [activeGroup, setActiveGroup] = useState("Todos");
   const [refreshing, setRefreshing] = useState(false);
   const [cachedData, setCachedData] = useState<Copa2026ScoresResponse | null>(null);
@@ -60,7 +71,7 @@ export default function MobileScoreboard() {
       refetchInterval: (query) => {
         const matches = query.state.data?.matches;
         const hasLive = Array.isArray(matches) && matches.some((m) => m.status === "LIVE");
-        return hasLive ? 30_000 : 60_000;
+        return hasLive ? 15_000 : 45_000;
       },
     },
   });
@@ -114,9 +125,15 @@ export default function MobileScoreboard() {
 
   const filteredMatches = useMemo(() => {
     if (!data?.matches) return [];
-    return data.matches.filter((m) =>
-      activeGroup === "Todos" ? true : m.group === activeGroup
-    );
+    const statusOrder = { LIVE: 0, FINISHED: 1, PENDING: 2 } as const;
+    return data.matches
+      .filter((m) => activeGroup === "Todos" ? true : m.group === activeGroup)
+      .sort((a, b) => {
+        const sa = statusOrder[a.status as keyof typeof statusOrder] ?? 3;
+        const sb = statusOrder[b.status as keyof typeof statusOrder] ?? 3;
+        if (sa !== sb) return sa - sb;
+        return new Date(b.date).getTime() - new Date(a.date).getTime();
+      });
   }, [data, activeGroup]);
 
   const stats = useMemo(() => ({
@@ -128,23 +145,28 @@ export default function MobileScoreboard() {
   const lastSync = useMemo(() => {
     if (!data?.updatedAt) return "";
     try {
-      return format(new Date(data.updatedAt), "dd/MM HH:mm:ss", { locale: ptBR });
+      return formatDistanceToNow(new Date(data.updatedAt), { addSuffix: true, locale: ptBR });
     } catch {
       return "";
     }
   }, [data]);
 
   return (
-    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "system-ui, sans-serif", overscrollBehaviorY: "contain" }}>
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "system-ui, sans-serif", overscrollBehaviorY: "contain", paddingBottom: 72 }}>
       {/* Header */}
       <header style={{ position: "sticky", top: 0, zIndex: 50, background: C.bg + "f5", borderBottom: `1px solid ${C.border}`, backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)" }}>
         <div style={{ padding: "12px 16px" }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <Trophy size={22} color={C.gold} />
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: `linear-gradient(135deg, ${C.gold}30, ${C.gold}08)`, border: `1px solid ${C.gold}40`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <Trophy size={18} color={C.gold} />
+              </div>
               <div>
-                <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase", lineHeight: 1.1 }}>Copa 2026</div>
-                <div style={{ fontSize: 10, color: C.gold, fontWeight: 600, letterSpacing: "0.15em", textTransform: "uppercase" }}>Placares ao Vivo</div>
+                <div style={{ fontSize: 16, fontWeight: 900, lineHeight: 1.1 }}>
+                  <span style={{ color: C.gold }}>seliga</span><span>aqui</span>
+                  <span style={{ color: C.muted, fontSize: 11, fontWeight: 600 }}>.online</span>
+                </div>
+                <div style={{ fontSize: 10, color: C.muted, fontWeight: 500 }}>Copa 2026 ao vivo</div>
               </div>
             </div>
 
@@ -187,7 +209,8 @@ export default function MobileScoreboard() {
           </div>
         </div>
 
-        {/* Group tabs */}
+        {/* Group tabs — placares only */}
+        {activeTab === "placares" && (
         <div style={{ display: "flex", overflowX: "auto", gap: 6, padding: "8px 16px 10px", scrollbarWidth: "none" }}>
           {GROUPS.map((g) => (
             <button
@@ -212,10 +235,23 @@ export default function MobileScoreboard() {
             </button>
           ))}
         </div>
+        )}
       </header>
 
-      {/* Match list */}
-      <main style={{ padding: "12px 12px 40px" }}>
+      {/* Content */}
+      <main style={{ padding: activeTab === "placares" ? "12px 12px 40px" : "8px 8px 40px" }}>
+        {activeTab === "grupos" && (
+          <div className="px-1">
+            <GroupStandings />
+          </div>
+        )}
+        {activeTab === "artilheiros" && (
+          <div className="px-1">
+            <TopScorers />
+          </div>
+        )}
+        {activeTab === "placares" && (
+        <>
         {isLoading && !data ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {Array.from({ length: 6 }).map((_, i) => (
@@ -247,7 +283,31 @@ export default function MobileScoreboard() {
             ))}
           </div>
         )}
+        </>
+        )}
       </main>
+
+      {/* Bottom tab bar */}
+      <nav style={{
+        position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 60,
+        display: "flex", background: C.sheet, borderTop: `1px solid ${C.border}`,
+        paddingBottom: "env(safe-area-inset-bottom, 0px)",
+      }}>
+        {TABS.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            style={{
+              flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3,
+              padding: "10px 4px 12px", background: "none", border: "none", cursor: "pointer",
+              color: activeTab === tab.id ? C.gold : C.muted,
+            }}
+          >
+            {tab.icon}
+            <span style={{ fontSize: 10, fontWeight: 700 }}>{tab.label}</span>
+          </button>
+        ))}
+      </nav>
 
       {/* Detail Sheet */}
       <MatchDetailSheet
@@ -365,6 +425,13 @@ function MobileMatchCard({ match, scoreChanged, isNewLive, onTap }: MobileMatchC
           isLive={isLive}
           scoreChanged={scoreChanged}
         />
+        {(match.goalScorers?.home ?? []).length > 0 && (
+          <div style={{ paddingLeft: 32, display: "flex", flexWrap: "wrap", gap: "2px 8px", marginTop: -4 }}>
+            {match.goalScorers!.home.map((g, i) => (
+              <span key={i} style={{ fontSize: 10, color: C.muted }}>⚽ {g}</span>
+            ))}
+          </div>
+        )}
         <TeamRow
           flag={match.awayTeam.flag}
           name={match.awayTeam.name}
@@ -372,7 +439,21 @@ function MobileMatchCard({ match, scoreChanged, isNewLive, onTap }: MobileMatchC
           isLive={isLive}
           scoreChanged={scoreChanged}
         />
+        {(match.goalScorers?.away ?? []).length > 0 && (
+          <div style={{ paddingLeft: 32, display: "flex", flexWrap: "wrap", gap: "2px 8px", marginTop: -4 }}>
+            {match.goalScorers!.away.map((g, i) => (
+              <span key={i} style={{ fontSize: 10, color: C.muted }}>⚽ {g}</span>
+            ))}
+          </div>
+        )}
       </div>
+
+      {match.liveStats && (isLive || isFinished) && (
+        <div style={{ marginTop: 8, display: "flex", gap: 12, fontSize: 10, color: C.pend }}>
+          <span>🎯 {match.liveStats.shotsOnGoal[0]}-{match.liveStats.shotsOnGoal[1]}</span>
+          <span>⚽ {((match.liveStats as { totalShots?: [number, number] }).totalShots ?? match.liveStats.shotsOnGoal)[0]}-{((match.liveStats as { totalShots?: [number, number] }).totalShots ?? match.liveStats.shotsOnGoal)[1]}</span>
+        </div>
+      )}
 
       {/* Footer */}
       <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}60`, display: "flex", justifyContent: "space-between", fontSize: 10, color: C.pend }}>

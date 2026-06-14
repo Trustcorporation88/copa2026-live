@@ -62,7 +62,31 @@ export function TopScorers() {
   }
 
   return (
-    <div className="max-w-2xl mx-auto space-y-3">
+    <div className="max-w-2xl mx-auto space-y-4">
+      {scorers.length >= 3 && (
+        <div className="grid grid-cols-3 gap-2 mb-6 items-end pt-2">
+          {[scorers[1], scorers[0], scorers[2]].map((scorer, i) => {
+            const heights = ["h-24", "h-32", "h-20"];
+            return (
+              <div
+                key={scorer.player}
+                style={{ order: i === 0 ? 1 : i === 1 ? 0 : 2 }}
+                className={`flex flex-col items-center text-center ${i === 1 ? "-mt-2" : ""}`}
+              >
+                <PlayerPhoto photo={scorer.photo} name={scorer.player} />
+                <p className="text-xs font-bold mt-2 truncate w-full px-1">{scorer.player.split(" ").pop()}</p>
+                <p className="text-[10px] text-muted-foreground">{scorer.teamFlag}</p>
+                <div className={`mt-2 w-full rounded-t-xl bg-primary/10 border border-primary/20 flex flex-col items-center justify-end ${heights[i]} py-2`}>
+                  <span className="text-2xl">{scorer.rank === 1 ? "🥇" : scorer.rank === 2 ? "🥈" : "🥉"}</span>
+                  <span className="text-xl font-black text-primary tabular-nums">{scorer.goals}</span>
+                  <span className="text-[9px] text-muted-foreground uppercase">gols</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {scorers.map((scorer) => (
         <div
           key={scorer.player}
@@ -91,12 +115,17 @@ export function TopScorers() {
               <p className="text-2xl font-bold text-primary leading-none">{scorer.goals}</p>
               <p className="text-[10px] text-muted-foreground uppercase tracking-wide mt-0.5">gols</p>
             </div>
-            {scorer.assists > 0 && (
+            {scorer.assists > 0 ? (
               <div>
                 <p className="text-lg font-semibold text-muted-foreground leading-none">{scorer.assists}</p>
                 <p className="text-[10px] text-muted-foreground uppercase tracking-wide mt-0.5">assists</p>
               </div>
-            )}
+            ) : scorer.rank <= 5 ? (
+              <div className="opacity-40">
+                <p className="text-lg font-semibold text-muted-foreground leading-none">0</p>
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wide mt-0.5">assists</p>
+              </div>
+            ) : null}
           </div>
         </div>
       ))}

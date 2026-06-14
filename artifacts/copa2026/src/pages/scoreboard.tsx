@@ -1,14 +1,16 @@
-import React, { useState, useEffect, useMemo } from "react";
-import { format } from "date-fns";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { format, formatDistanceToNow } from "date-fns";
 import { ptBR } from "date-fns/locale";
-import { Search, Trophy, WifiOff, LayoutGrid, Target, GitBranch } from "lucide-react";
+import { Search, Trophy, LayoutGrid, Target, GitBranch } from "lucide-react";
 import { useGetCopa2026Scores, getGetCopa2026ScoresQueryKey } from "@workspace/api-client-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Input } from "@/components/ui/input";
 import { MatchCard } from "@/components/match-card";
 import { MatchStatsDrawer } from "@/components/match-stats-drawer";
 import { GroupStandings } from "@/components/group-standings";
 import { TopScorers } from "@/components/top-scorers";
 import { Bracket } from "@/components/bracket";
+import { SiteHeader } from "@/components/site-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { Copa2026ScoresResponse, Copa2026Match } from "@workspace/api-client-react";
 
@@ -32,6 +34,7 @@ export default function Scoreboard() {
   const [cachedData, setCachedData] = useState<Copa2026ScoresResponse | null>(null);
   const [selectedMatch, setSelectedMatch] = useState<ExtendedMatch | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     try {
@@ -40,16 +43,20 @@ export default function Scoreboard() {
     } catch { /* noop */ }
   }, []);
 
-  const { data: apiData, isLoading, isError } = useGetCopa2026Scores({
+  const { data: apiData, isLoading, isError, isFetching } = useGetCopa2026Scores({
     query: {
       queryKey: getGetCopa2026ScoresQueryKey(),
       refetchInterval: (query) => {
         const matches = query.state.data?.matches;
         const hasLive = Array.isArray(matches) && matches.some((m) => m.status === "LIVE");
-        return hasLive ? 30_000 : 60_000;
+        return hasLive ? 15_000 : 45_000;
       },
     }
   });
+
+  const handleRefresh = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: getGetCopa2026ScoresQueryKey() });
+  }, [queryClient]);
 
   useEffect(() => {
     if (apiData) {
@@ -65,15 +72,33 @@ export default function Scoreboard() {
 
   const filteredMatches = useMemo(() => {
     if (!data?.matches) return [];
-    return (data.matches as ExtendedMatch[]).filter(match => {
-      const matchesGroup = activeGroup === "Todos" || match.group === activeGroup.replace("Grupo ", "");
-      const q = searchQuery.toLowerCase();
-      const matchesSearch = !q ||
-        match.homeTeam.name.toLowerCase().includes(q) ||
-        match.awayTeam.name.toLowerCase().includes(q);
-      return matchesGroup && matchesSearch;
-    });
+    const statusOrder = { LIVE: 0, FINISHED: 1, PENDING: 2 } as const;
+    return (data.matches as ExtendedMatch[])
+      .filter(match => {
+        const matchesGroup = activeGroup === "Todos" || match.group === activeGroup.replace("Grupo ", "");
+        const q = searchQuery.toLowerCase();
+        const matchesSearch = !q ||
+          match.homeTeam.name.toLowerCase().includes(q) ||
+          match.awayTeam.name.toLowerCase().includes(q);
+        return matchesGroup && matchesSearch;
+      })
+      .sort((a, b) => {
+        const sa = statusOrder[a.status as keyof typeof statusOrder] ?? 3;
+        const sb = statusOrder[b.status as keyof typeof statusOrder] ?? 3;
+        if (sa !== sb) return sa - sb;
+        return new Date(b.date).getTime() - new Date(a.date).getTime();
+      });
   }, [data, activeGroup, searchQuery]);
+
+  const liveMatches = useMemo(
+    () => filteredMatches.filter(m => m.status === "LIVE"),
+    [filteredMatches]
+  );
+
+  const otherMatches = useMemo(
+    () => filteredMatches.filter(m => m.status !== "LIVE"),
+    [filteredMatches]
+  );
 
   const stats = useMemo(() => ({
     total: filteredMatches.length,
@@ -85,7 +110,8 @@ export default function Scoreboard() {
   const lastSyncText = useMemo(() => {
     if (!data?.updatedAt) return "";
     try {
-      return format(new Date(data.updatedAt), "dd/MM/yyyy, HH:mm:ss", { locale: ptBR });
+      const d = new Date(data.updatedAt);
+      return `Atualizado ${formatDistanceToNow(d, { addSuffix: true, locale: ptBR })}`;
     } catch { return ""; }
   }, [data]);
 
@@ -96,59 +122,36 @@ export default function Scoreboard() {
 
   return (
     <div className="min-h-screen bg-background text-foreground pb-20">
-      {/* Header */}
-      <header className="sticky top-0 z-10 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
-        <div className="container mx-auto px-4 py-4">
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <Trophy className="w-8 h-8 text-primary" />
-              <div>
-                <h1 className="text-xl font-bold tracking-tight uppercase">Copa 2026</h1>
-                <p className="text-xs text-primary font-medium tracking-widest">Placares ao Vivo</p>
-              </div>
-            </div>
-
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-4">
-              <div className="flex items-center justify-between sm:justify-end gap-3 text-xs">
-                {lastSyncText && (
-                  <span className="text-muted-foreground hidden sm:inline">Atualizado: {lastSyncText}</span>
-                )}
-                {isFallback ? (
-                  <span className="flex items-center gap-1.5 px-2 py-1 bg-muted rounded border border-border text-muted-foreground font-medium">
-                    <WifiOff className="w-3 h-3" />
-                    Fallback Local
-                  </span>
-                ) : (
-                  <span className="flex items-center gap-1.5 px-2 py-1 bg-primary/10 rounded border border-primary/30 text-primary font-medium">
-                    <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
-                    API Ao Vivo
-                  </span>
-                )}
-              </div>
-
-              {activeTab === "placares" && (
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <Input
-                    placeholder="Buscar seleção..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    className="pl-9 w-full sm:w-[200px] bg-card border-border focus-visible:ring-primary"
-                  />
-                </div>
-              )}
-            </div>
+      <SiteHeader
+        subtitle="Copa do Mundo 2026 · Placares ao vivo"
+        lastSyncText={lastSyncText}
+        isFallback={isFallback}
+        isFetching={isFetching}
+        onRefresh={handleRefresh}
+      >
+        {activeTab === "placares" && (
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              placeholder="Buscar seleção..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-9 w-full sm:w-[200px] bg-card border-border focus-visible:ring-primary"
+            />
           </div>
+        )}
+      </SiteHeader>
 
-          {/* Stats bar — only on placares tab */}
+      <div className="sticky top-[73px] z-[9] border-b border-border bg-background/90 backdrop-blur">
+        <div className="container mx-auto px-4 py-3 space-y-3">
           {activeTab === "placares" && (
-            <div className="mt-4 flex items-center gap-2 text-xs overflow-x-auto scrollbar-hide">
+            <div className="flex items-center gap-2 text-xs overflow-x-auto scrollbar-hide">
               <span className="shrink-0 text-muted-foreground">
                 <span className="font-bold text-foreground">{stats.total}</span> partidas
               </span>
               <span className="text-border shrink-0">·</span>
               <span className="flex items-center gap-1.5 shrink-0">
-                <span className="w-2 h-2 rounded-full bg-[#ef4444] shrink-0" />
+                <span className="w-2 h-2 rounded-full bg-[#ef4444] shrink-0 animate-pulse" />
                 <span className="font-bold text-[#ef4444]">{stats.live}</span>
                 <span className="text-muted-foreground">ao vivo</span>
               </span>
@@ -167,8 +170,7 @@ export default function Scoreboard() {
             </div>
           )}
 
-          {/* Tab navigation */}
-          <div className="mt-4 flex gap-1 overflow-x-auto scrollbar-hide -mx-1 px-1">
+          <div className="flex gap-1 overflow-x-auto scrollbar-hide -mx-1 px-1">
             {TABS.map((tab) => (
               <button
                 key={tab.id}
@@ -185,7 +187,7 @@ export default function Scoreboard() {
             ))}
           </div>
         </div>
-      </header>
+      </div>
 
       <main className="container mx-auto px-4 py-8">
         {/* ── Placares ── */}
@@ -228,16 +230,51 @@ export default function Scoreboard() {
                 </button>
               </div>
             ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                {filteredMatches.map((match, index) => (
-                  <MatchCard
-                    key={match.id}
-                    match={match}
-                    index={index}
-                    onClick={() => handleMatchClick(match)}
-                  />
-                ))}
-              </div>
+              <>
+                {liveMatches.length > 0 && (
+                  <section className="mb-8">
+                    <div className="flex items-center gap-2 mb-4">
+                      <span className="relative flex h-2.5 w-2.5">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75" />
+                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500" />
+                      </span>
+                      <h2 className="text-sm font-bold uppercase tracking-wider text-red-500">
+                        Ao vivo agora ({liveMatches.length})
+                      </h2>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                      {liveMatches.map((match, index) => (
+                        <MatchCard
+                          key={match.id}
+                          match={match}
+                          index={index}
+                          onClick={() => handleMatchClick(match)}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                {otherMatches.length > 0 && (
+                  <section>
+                    {liveMatches.length > 0 && (
+                      <h2 className="text-sm font-bold uppercase tracking-wider text-muted-foreground mb-4">
+                        Outras partidas
+                      </h2>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                      {otherMatches.map((match, index) => (
+                        <MatchCard
+                          key={match.id}
+                          match={match}
+                          index={index}
+                          onClick={() => handleMatchClick(match)}
+                        />
+                      ))}
+                    </div>
+                  </section>
+                )}
+              </>
             )}
           </>
         )}
