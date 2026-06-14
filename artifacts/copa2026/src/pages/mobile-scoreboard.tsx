@@ -77,7 +77,7 @@ export default function MobileScoreboard() {
   });
 
   useEffect(() => {
-    if (apiData) {
+    if (apiData && (apiData.matches?.length ?? 0) > 0) {
       const prev = prevSnapshotsRef.current;
       const changed = new Set<string>();
       const newLive = new Set<string>();
@@ -114,8 +114,12 @@ export default function MobileScoreboard() {
     }
   }, [apiData]);
 
-  const data = apiData ?? cachedData;
-  const isFallback = isError || (!apiData && !!cachedData);
+  const liveApiData = apiData && (apiData.matches?.length ?? 0) > 0 ? apiData : null;
+  const data = liveApiData ?? cachedData;
+  const isFallback =
+    isError ||
+    apiData?.source === "cache" ||
+    (!liveApiData && !!cachedData);
 
   const handleRefresh = useCallback(async () => {
     setRefreshing(true);

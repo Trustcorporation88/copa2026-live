@@ -203,9 +203,10 @@ async function fetchSdbTimeline(eventId: string, ttl = TIMELINE_TTL): Promise<Sd
   if (cached && now < cached.expiresAt) return cached.data;
 
   try {
-    const res = await fetch(
-      `https://www.thesportsdb.com/api/v1/json/3/lookuptimeline.php?id=${eventId}`,
-      { signal: AbortSignal.timeout(5000) }
+    const res = await fetchWithRetry(
+      sdbApiUrl(`lookuptimeline.php?id=${eventId}`),
+      { signal: AbortSignal.timeout(5000) },
+      2
     );
     if (!res.ok) return [];
     const json = await res.json() as { timeline?: SdbTimelineEntry[] };
@@ -291,9 +292,10 @@ async function fetchLiveEventDetail(eventId: string, ttl = LIVE_DETAIL_TTL): Pro
   if (cached && now < cached.expiresAt) return cached.data;
 
   try {
-    const res = await fetch(
-      `https://www.thesportsdb.com/api/v1/json/3/lookupevent.php?id=${eventId}`,
-      { signal: AbortSignal.timeout(4000) }
+    const res = await fetchWithRetry(
+      sdbApiUrl(`lookupevent.php?id=${eventId}`),
+      { signal: AbortSignal.timeout(4000) },
+      2
     );
     if (!res.ok) return null;
     const json = await res.json() as { events?: SdbEventDetail[] };
@@ -336,7 +338,9 @@ interface TopScorersCache {
   expiresAt: number;
 }
 let topScorersCache: TopScorersCache | null = null;
+let staleTopScorersCache: TopScorersCache | null = null;
 const TOPSCORERS_TTL = 300_000;
+const STALE_TOPSCORERS_TTL = 1_800_000;
 
 interface BracketCache {
   data: BracketMatch[];
@@ -392,6 +396,163 @@ interface BracketMatch {
 
 // ─── Data fetching ──────────────────────────────────────────────────────────
 
+/** TheSportsDB: key 3 returns ~5 WC events; key 123 returns full 72-match season feed. */
+const SDB_API_KEYS = (process.env.THESPORTSDB_API_KEYS ?? "123,3").split(",").map(k => k.trim()).filter(Boolean);
+let activeSdbApiKey = SDB_API_KEYS[0] ?? "123";
+
+function sdbApiUrl(path: string): string {
+  return `https://www.thesportsdb.com/api/v1/json/${activeSdbApiKey}/${path}`;
+}
+
+const ESPN_TO_CANONICAL: Record<string, string> = {
+  "United States": "USA",
+  "Czechia": "Czech Republic",
+  "Türkiye": "Turkey",
+  "Turkey": "Turkey",
+  "Côte d'Ivoire": "Ivory Coast",
+};
+
+interface EspnScoreEntry {
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number | null;
+  awayScore: number | null;
+  status: "PENDING" | "LIVE" | "FINISHED";
+  minute: string | null;
+  goalScorers: { home: string[]; away: string[] } | null;
+}
+
+async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, 400 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+function espnStatusToMatch(statusName: string, state?: string): "PENDING" | "LIVE" | "FINISHED" {
+  const n = statusName.toUpperCase();
+  if (n.includes("FULL_TIME") || n.includes("FINAL") || (n === "STATUS_POSTPONED" && state === "post")) return "FINISHED";
+  if (n.includes("IN_PROGRESS") || n.includes("HALF") || n.includes("EXTRA") || n.includes("PENALT")) return "LIVE";
+  if (state === "in") return "LIVE";
+  if (state === "post") return "FINISHED";
+  return "PENDING";
+}
+
+function goalScorersFromEspnDetails(
+  details: Array<{
+    type?: { text?: string };
+    clock?: { displayValue?: string };
+    scoringPlay?: boolean;
+    ownGoal?: boolean;
+    team?: { id?: string };
+    athletesInvolved?: Array<{ displayName?: string }>;
+  }>,
+  homeTeamId: string
+): { home: string[]; away: string[] } {
+  const home: string[] = [];
+  const away: string[] = [];
+  for (const d of details) {
+    if (!d.scoringPlay || d.ownGoal) continue;
+    const text = d.type?.text ?? "";
+    if (!/goal|penalty/i.test(text)) continue;
+    const player = d.athletesInvolved?.[0]?.displayName?.trim();
+    if (!player) continue;
+    const minute = d.clock?.displayValue ?? "";
+    const entry = minute ? `${player} ${minute}` : player;
+    if (String(d.team?.id) === homeTeamId) home.push(entry);
+    else away.push(entry);
+  }
+  return { home, away };
+}
+
+async function fetchEspnScoresForDates(dates: string[]): Promise<Map<string, EspnScoreEntry>> {
+  const map = new Map<string, EspnScoreEntry>();
+  const unique = [...new Set(dates.map(d => d.replace(/-/g, "")))];
+  if (unique.length === 0) return map;
+
+  const results = await mapPool(unique, async (yyyymmdd) => {
+    try {
+      const r = await fetchWithRetry(
+        `https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=${yyyymmdd}`,
+        { headers: { "User-Agent": "seligaaqui.online/1.0" }, signal: AbortSignal.timeout(8000) },
+        2
+      );
+      if (!r.ok) return [] as EspnScoreEntry[];
+      const json = await r.json() as {
+        events?: Array<{
+          competitions?: Array<{
+            status?: { displayClock?: string; type?: { name?: string; state?: string } };
+            competitors?: Array<{ homeAway?: string; score?: string; team?: { id?: string; displayName?: string } }>;
+            details?: Array<{
+              type?: { text?: string };
+              clock?: { displayValue?: string };
+              scoringPlay?: boolean;
+              ownGoal?: boolean;
+              team?: { id?: string };
+              athletesInvolved?: Array<{ displayName?: string }>;
+            }>;
+          }>;
+        }>;
+      };
+      const entries: EspnScoreEntry[] = [];
+      for (const ev of json.events ?? []) {
+        const comp = ev.competitions?.[0];
+        if (!comp) continue;
+        const homeC = comp.competitors?.find(c => c.homeAway === "home");
+        const awayC = comp.competitors?.find(c => c.homeAway === "away");
+        const homeRaw = homeC?.team?.displayName ?? "";
+        const awayRaw = awayC?.team?.displayName ?? "";
+        if (!homeRaw || !awayRaw) continue;
+        const homeCanon = ESPN_TO_CANONICAL[homeRaw] ?? homeRaw;
+        const awayCanon = ESPN_TO_CANONICAL[awayRaw] ?? awayRaw;
+        const hs = parseScore(homeC?.score);
+        const as_ = parseScore(awayC?.score);
+        const status = espnStatusToMatch(comp.status?.type?.name ?? "", comp.status?.type?.state);
+        const homeTeamId = String(homeC?.team?.id ?? "");
+        const goalScorers = comp.details?.length
+          ? goalScorersFromEspnDetails(comp.details, homeTeamId)
+          : null;
+        const hasGoals = goalScorers && (goalScorers.home.length > 0 || goalScorers.away.length > 0);
+        entries.push({
+          homeTeam: homeCanon,
+          awayTeam: awayCanon,
+          homeScore: hs,
+          awayScore: as_,
+          status,
+          minute: status === "LIVE" ? (comp.status?.displayClock ?? null) : null,
+          goalScorers: hasGoals ? goalScorers : null,
+        });
+      }
+      return entries;
+    } catch (err) {
+      logger.warn({ err, yyyymmdd }, "ESPN scoreboard fetch failed");
+      return [];
+    }
+  }, 4);
+
+  for (const entries of results) {
+    for (const e of entries) {
+      map.set(sdbEventKey(e.homeTeam, e.awayTeam), e);
+    }
+  }
+  return map;
+}
+
+async function fetchEspnScoresSafe(dates: string[]): Promise<Map<string, EspnScoreEntry>> {
+  try {
+    return await fetchEspnScoresForDates(dates);
+  } catch (err) {
+    logger.warn({ err }, "ESPN scores fetch failed");
+    return new Map();
+  }
+}
+
 async function mapPool<T, R>(
   items: T[],
   fn: (item: T) => Promise<R>,
@@ -432,9 +593,10 @@ function getStaleScoresResponse(): { matches: Match[]; updatedAt: string; source
 async function fetchFdFixtures(allStages = false): Promise<FdMatch[]> {
   const key = process.env.FOOTBALL_DATA_API_KEY ?? "";
   if (!key) throw new Error("FOOTBALL_DATA_API_KEY not set");
-  const res = await fetch(
+  const res = await fetchWithRetry(
     "https://api.football-data.org/v4/competitions/WC/matches?season=2026",
-    { headers: { "X-Auth-Token": key }, signal: AbortSignal.timeout(8000) }
+    { headers: { "X-Auth-Token": key }, signal: AbortSignal.timeout(10000) },
+    3
   );
   if (!res.ok) throw new Error(`FD HTTP ${res.status}`);
   const json = await res.json() as { matches?: FdMatch[] };
@@ -452,12 +614,13 @@ async function fetchFdFixturesSafe(allStages = false): Promise<FdMatch[] | null>
   }
 }
 
-async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
-  const res = await fetch(
-    "https://www.thesportsdb.com/api/v1/json/3/eventsseason.php?id=4429&s=2026",
-    { signal: AbortSignal.timeout(6000) }
+async function fetchSdbScoresWithKey(apiKey: string): Promise<Map<string, SdbEvent>> {
+  const res = await fetchWithRetry(
+    `https://www.thesportsdb.com/api/v1/json/${apiKey}/eventsseason.php?id=4429&s=2026`,
+    { signal: AbortSignal.timeout(8000) },
+    2
   );
-  if (!res.ok) throw new Error(`SDB HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`SDB HTTP ${res.status} (key ${apiKey})`);
   const json = await res.json() as { events?: SdbEvent[] };
   const map = new Map<string, SdbEvent>();
   for (const ev of (json.events ?? [])) {
@@ -466,6 +629,24 @@ async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
     }
   }
   return map;
+}
+
+async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
+  let best = new Map<string, SdbEvent>();
+  for (const apiKey of SDB_API_KEYS) {
+    try {
+      const map = await fetchSdbScoresWithKey(apiKey);
+      if (map.size > best.size) {
+        best = map;
+        activeSdbApiKey = apiKey;
+      }
+      if (map.size >= 48) break;
+    } catch (err) {
+      logger.warn({ err, apiKey }, "SDB season fetch failed for key");
+    }
+  }
+  if (best.size === 0) throw new Error("All SDB API keys failed");
+  return best;
 }
 
 async function fetchSdbScoresSafe(): Promise<Map<string, SdbEvent>> {
@@ -507,9 +688,10 @@ async function supplementSdbMap(map: Map<string, SdbEvent>, dates: string[]): Pr
     const results = await Promise.all(
       batch.map(async (date) => {
         try {
-          const r = await fetch(
-            `https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=${date}&s=Soccer`,
-            { signal: AbortSignal.timeout(5000) }
+          const r = await fetchWithRetry(
+            sdbApiUrl(`eventsday.php?d=${date}&s=Soccer`),
+            { signal: AbortSignal.timeout(5000) },
+            2
           );
           if (!r.ok) return [] as SdbEvent[];
           const j = await r.json() as { events?: SdbEvent[] };
@@ -534,9 +716,10 @@ async function supplementSdbMap(map: Map<string, SdbEvent>, dates: string[]): Pr
 async function searchSdbEvent(homeEn: string, awayEn: string): Promise<SdbEvent | null> {
   const query = `${canonical(homeEn)}_vs_${canonical(awayEn)}`;
   try {
-    const r = await fetch(
-      `https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=${encodeURIComponent(query)}`,
-      { signal: AbortSignal.timeout(4000) }
+    const r = await fetchWithRetry(
+      sdbApiUrl(`searchevents.php?e=${encodeURIComponent(query)}`),
+      { signal: AbortSignal.timeout(4000) },
+      2
     );
     if (!r.ok) return null;
     const j = await r.json() as { event?: SdbEvent[] };
@@ -618,9 +801,10 @@ function extractMinute(sdbEv: SdbEvent | undefined, detail: SdbEventDetail | nul
 
 async function fetchSdbStatsOnly(sdbId: string): Promise<Match["liveStats"]> {
   try {
-    const r = await fetch(
-      `https://www.thesportsdb.com/api/v1/json/3/lookupeventstats.php?id=${sdbId}`,
-      { signal: AbortSignal.timeout(5000) }
+    const r = await fetchWithRetry(
+      sdbApiUrl(`lookupeventstats.php?id=${sdbId}`),
+      { signal: AbortSignal.timeout(5000) },
+      2
     );
     if (!r.ok) return null;
     const json = await r.json() as {
@@ -723,7 +907,119 @@ async function mergeStats(
   };
 }
 
-async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "cache" | "static" }> {
+async function buildSdbOnlyMatches(
+  sdbMap: Map<string, SdbEvent>,
+  espnMap: Map<string, EspnScoreEntry> = new Map()
+): Promise<Match[]> {
+  const today = new Date();
+  const recentDates = Array.from({ length: 14 }, (_, i) => {
+    const d = new Date(today);
+    d.setDate(d.getDate() - 7 + i);
+    return d.toISOString().slice(0, 10);
+  });
+
+  try {
+    await supplementSdbMap(sdbMap, recentDates);
+  } catch { /* non-fatal */ }
+
+  const matchesBase: Match[] = [...sdbMap.values()].map((ev, idx) => {
+    const homeEn = ev.strHomeTeam;
+    const awayEn = ev.strAwayTeam;
+    const espnEv = espnMap.get(sdbEventKey(homeEn, awayEn));
+    const hs = parseScore(ev.intHomeScore) ?? espnEv?.homeScore ?? null;
+    const as_ = parseScore(ev.intAwayScore) ?? espnEv?.awayScore ?? null;
+    const hasScore = hs !== null && as_ !== null;
+    let status = toStatus(
+      ev.strStatus === "FT" || ev.strStatus === "AET" ? "FINISHED" : "TIMED",
+      `${ev.dateEvent}T${ev.strTime ?? "00:00:00"}Z`,
+      ev.strStatus,
+      hasScore
+    );
+    if (espnEv && (status === "PENDING" || !hasScore)) {
+      if (espnEv.status === "LIVE" || espnEv.status === "FINISHED") status = espnEv.status;
+    }
+    const homeGoals = parseGoalScorers(ev.strHomeGoalDetails);
+    const awayGoals = parseGoalScorers(ev.strAwayGoalDetails);
+    const espnGoals = espnEv?.goalScorers;
+    const hasGoalData =
+      homeGoals.length > 0 || awayGoals.length > 0 ||
+      (espnGoals != null && (espnGoals.home.length > 0 || espnGoals.away.length > 0));
+    const goalScorers = hasGoalData
+      ? {
+          home: homeGoals.length > 0 ? homeGoals : (espnGoals?.home ?? []),
+          away: awayGoals.length > 0 ? awayGoals : (espnGoals?.away ?? []),
+        }
+      : null;
+    return {
+      id: ev.idEvent,
+      matchNumber: idx + 1,
+      group: "?",
+      round: `Rodada ${ev.intRound ?? 1}`,
+      date: `${ev.dateEvent}T${ev.strTime ?? "00:00:00"}Z`,
+      venue: ev.strVenue ?? "",
+      homeTeam: { name: PT_NAME[homeEn] ?? homeEn, flag: FLAG[homeEn] ?? "🏳️", badge: ev.strHomeTeamBadge ?? null },
+      awayTeam: { name: PT_NAME[awayEn] ?? awayEn, flag: FLAG[awayEn] ?? "🏳️", badge: ev.strAwayTeamBadge ?? null },
+      homeScore: hs,
+      awayScore: as_,
+      status,
+      theSportsDbId: ev.idEvent,
+      thumbnail: ev.strThumb ?? null,
+      minute: status === "LIVE" ? (espnEv?.minute ?? extractMinute(ev, null)) : null,
+      goalScorers: goalScorers && (goalScorers.home.length > 0 || goalScorers.away.length > 0) ? goalScorers : null,
+      liveStats: null,
+    };
+  });
+
+  const statsMatches = matchesBase.filter(
+    (m) => (m.status === "LIVE" || m.status === "FINISHED") && m.theSportsDbId
+  );
+
+  try {
+    const [statsResults, fallbackTimelineResults] = await Promise.all([
+      mapPool(statsMatches, async m => ({
+        id: m.theSportsDbId!,
+        stats: await fetchSdbStatsOnly(m.theSportsDbId!),
+      }), 6),
+      mapPool(
+        matchesBase.filter(m => (m.status === "FINISHED" || m.status === "LIVE") && m.theSportsDbId && !m.goalScorers),
+        async m => ({
+          id: m.theSportsDbId!,
+          goals: goalScorersFromTimeline(await fetchSdbTimeline(m.theSportsDbId!)),
+        }),
+        6
+      ),
+    ]);
+    const statsById = new Map(statsResults.filter(r => r.stats).map(r => [r.id, r.stats!]));
+    const fallbackGoalsById = new Map(
+      fallbackTimelineResults
+        .filter(r => r.goals.home.length > 0 || r.goals.away.length > 0)
+        .map(r => [r.id, r.goals])
+    );
+
+    return matchesBase.map(m => {
+      const fromTimeline = m.theSportsDbId ? fallbackGoalsById.get(m.theSportsDbId) : undefined;
+      const goalScorers = m.goalScorers ?? (
+        fromTimeline && (fromTimeline.home.length > 0 || fromTimeline.away.length > 0) ? fromTimeline : null
+      );
+      return {
+        ...m,
+        goalScorers,
+        liveStats: m.status === "LIVE" || m.status === "FINISHED"
+          ? statsById.get(m.theSportsDbId ?? "") ?? null
+          : null,
+      };
+    });
+  } catch (err) {
+    logger.warn({ err }, "SDB-only enrichment failed");
+    return matchesBase;
+  }
+}
+
+async function buildAllMatches(): Promise<{
+  matches: Match[];
+  source: "live" | "cache" | "static";
+  providers: string[];
+}> {
   const stale = getStaleScoresResponse();
   try {
     const [fdMatches, sdbMap] = await Promise.all([
@@ -731,11 +1027,33 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
       fetchSdbScoresSafe(),
     ]);
 
+    const espnDates = (() => {
+      const today = new Date();
+      const out: string[] = [];
+      for (let i = -10; i <= 3; i++) {
+        const d = new Date(today);
+        d.setDate(d.getDate() + i);
+        out.push(d.toISOString().slice(0, 10));
+      }
+      if (fdMatches) {
+        for (const m of fdMatches) {
+          const d = (m.utcDate ?? "").slice(0, 10);
+          if (d) out.push(d);
+        }
+      }
+      return out;
+    })();
+    const espnMap = await fetchEspnScoresSafe(espnDates);
+    const providers: string[] = [];
+    if (fdMatches?.length) providers.push("football-data");
+    if (sdbMap.size > 0) providers.push(`thesportsdb:${activeSdbApiKey}`);
+    if (espnMap.size > 0) providers.push("espn");
+
     if (!fdMatches || fdMatches.length === 0) {
-      const sdbOnly = await buildSdbOnlyMatches(sdbMap);
-      if (sdbOnly.length > 0) return { matches: sdbOnly, source: "live" };
-      if (stale) return { matches: stale.matches, source: "cache" };
-      return { matches: [], source: "static" };
+      const sdbOnly = await buildSdbOnlyMatches(sdbMap, espnMap);
+      if (sdbOnly.length > 0) return { matches: sdbOnly, source: "live", providers };
+      if (stale) return { matches: stale.matches, source: "cache", providers: ["cache"] };
+      return { matches: [], source: "static", providers };
     }
 
     await enrichSdbMapSafe(sdbMap, fdMatches);
@@ -743,21 +1061,27 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
     const initialMatches = fdMatches.map((fdm, idx) => {
       const homeEn = fdm.homeTeam.name ?? "";
       const awayEn = fdm.awayTeam.name ?? "";
-      const sdbEv = sdbMap.get(sdbEventKey(homeEn, awayEn));
+      const key = sdbEventKey(homeEn, awayEn);
+      const sdbEv = sdbMap.get(key);
+      const espnEv = espnMap.get(key);
 
       const sdbHs = parseScore(sdbEv?.intHomeScore);
       const sdbAs = parseScore(sdbEv?.intAwayScore);
       const fdHs = fdm.score?.fullTime?.home ?? null;
       const fdAs = fdm.score?.fullTime?.away ?? null;
-      const rawHs = sdbHs ?? fdHs;
-      const rawAs = sdbAs ?? fdAs;
+      const rawHs = sdbHs ?? fdHs ?? espnEv?.homeScore ?? null;
+      const rawAs = sdbAs ?? fdAs ?? espnEv?.awayScore ?? null;
       const hasScore = rawHs !== null && rawAs !== null;
-      const status = toStatus(fdm.status ?? "", fdm.utcDate ?? "", sdbEv?.strStatus, hasScore);
+      let status = toStatus(fdm.status ?? "", fdm.utcDate ?? "", sdbEv?.strStatus, hasScore);
+      if (espnEv && (status === "PENDING" || !hasScore)) {
+        if (espnEv.status === "LIVE" || espnEv.status === "FINISHED") status = espnEv.status;
+      }
 
       return {
         idx,
         fdm,
         sdbEv,
+        espnEv,
         homeEn,
         awayEn,
         rawHs,
@@ -845,7 +1169,7 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
       logger.warn({ err }, "Match enrichment failed — returning base scores");
     }
 
-    const matches: Match[] = initialMatches.map(({ idx, sdbEv, homeEn, awayEn, rawHs, rawAs, status, theSportsDbId, fdm }) => {
+    const matches: Match[] = initialMatches.map(({ idx, sdbEv, espnEv, homeEn, awayEn, rawHs, rawAs, status, theSportsDbId, fdm }) => {
       const detail = theSportsDbId ? (liveDetails.get(theSportsDbId) ?? null) : null;
       const goalHomeDetails = detail?.strHomeGoalDetails ?? sdbEv?.strHomeGoalDetails;
       const goalAwayDetails = detail?.strAwayGoalDetails ?? sdbEv?.strAwayGoalDetails;
@@ -857,6 +1181,10 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
           homeGoals = fromTimeline.home;
           awayGoals = fromTimeline.away;
         }
+      }
+      if (homeGoals.length === 0 && awayGoals.length === 0 && espnEv?.goalScorers) {
+        homeGoals = espnEv.goalScorers.home;
+        awayGoals = espnEv.goalScorers.away;
       }
       const hasGoalData = homeGoals.length > 0 || awayGoals.length > 0;
 
@@ -874,107 +1202,39 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
         status,
         theSportsDbId,
         thumbnail: sdbEv?.strThumb ?? null,
-        minute: status === "LIVE" ? extractMinute(sdbEv, detail) : null,
+        minute: status === "LIVE" ? (espnEv?.minute ?? extractMinute(sdbEv, detail)) : null,
         goalScorers: hasGoalData ? { home: homeGoals, away: awayGoals } : null,
         liveStats: (status === "LIVE" || status === "FINISHED") ? (liveStatsMap.get(theSportsDbId ?? "") ?? null) : null,
       };
     });
 
-    return { matches, source: "live" };
+    return { matches, source: "live", providers };
   } catch (err) {
-    logger.warn({ err }, "Primary fetch failed, falling back to SDB only");
+    logger.warn({ err }, "Primary fetch failed, falling back to SDB + ESPN");
     try {
-      const sdbMap = await fetchSdbScores();
-      const today = new Date();
-      const recentDates = Array.from({ length: 14 }, (_, i) => {
-        const d = new Date(today);
-        d.setDate(d.getDate() - 7 + i);
-        return d.toISOString().slice(0, 10);
-      });
-      await supplementSdbMap(sdbMap, recentDates);
-      const now = new Date();
-      const matchesBase: Match[] = [...sdbMap.values()].map((ev, idx) => {
-        const homeEn = ev.strHomeTeam;
-        const awayEn = ev.strAwayTeam;
-        const hs = ev.intHomeScore != null ? parseInt(ev.intHomeScore, 10) : null;
-        const as_ = ev.intAwayScore != null ? parseInt(ev.intAwayScore, 10) : null;
-        const matchDate = new Date(`${ev.dateEvent}T${ev.strTime ?? "00:00:00"}Z`);
-        const diffMins = (now.getTime() - matchDate.getTime()) / 60000;
-        let status: "PENDING" | "LIVE" | "FINISHED" = "PENDING";
-        if (ev.strStatus === "FT" || ev.strStatus === "AET") status = "FINISHED";
-        else if (diffMins > 0 && diffMins < 120) status = "LIVE";
-        else if (diffMins >= 120) status = "FINISHED";
-        const homeGoals = parseGoalScorers(ev.strHomeGoalDetails);
-        const awayGoals = parseGoalScorers(ev.strAwayGoalDetails);
-        const hasGoalData = homeGoals.length > 0 || awayGoals.length > 0;
-        return {
-          id: ev.idEvent,
-          matchNumber: idx + 1,
-          group: "?",
-          round: `Rodada ${ev.intRound ?? 1}`,
-          date: `${ev.dateEvent}T${ev.strTime ?? "00:00:00"}Z`,
-          venue: ev.strVenue ?? "",
-          homeTeam: { name: PT_NAME[homeEn] ?? homeEn, flag: FLAG[homeEn] ?? "🏳️", badge: ev.strHomeTeamBadge ?? null },
-          awayTeam: { name: PT_NAME[awayEn] ?? awayEn, flag: FLAG[awayEn] ?? "🏳️", badge: ev.strAwayTeamBadge ?? null },
-          homeScore: hs !== null && !isNaN(hs) ? hs : null,
-          awayScore: as_ !== null && !isNaN(as_) ? as_ : null,
-          status,
-          theSportsDbId: ev.idEvent,
-          thumbnail: ev.strThumb ?? null,
-          minute: status === "LIVE" ? extractMinute(ev, null) : null,
-          goalScorers: hasGoalData ? { home: homeGoals, away: awayGoals } : null,
-          liveStats: null,
-        };
-      });
-
-      const statsMatches = matchesBase.filter(
-        (m) => (m.status === "LIVE" || m.status === "FINISHED") && m.theSportsDbId
-      );
-      const [statsResults, fallbackTimelineResults] = await Promise.all([
-        Promise.all(
-          statsMatches.map(async (m) => ({
-            id: m.theSportsDbId!,
-            stats: await fetchSdbStatsOnly(m.theSportsDbId!),
-          }))
-        ),
-        Promise.all(
-          matchesBase
-            .filter(m => (m.status === "FINISHED" || m.status === "LIVE") && m.theSportsDbId && !m.goalScorers)
-            .map(async m => ({
-              id: m.theSportsDbId!,
-              goals: goalScorersFromTimeline(await fetchSdbTimeline(m.theSportsDbId!)),
-            }))
+      const [sdbMap, espnMap] = await Promise.all([
+        fetchSdbScoresSafe(),
+        fetchEspnScoresSafe(
+          Array.from({ length: 14 }, (_, i) => {
+            const d = new Date();
+            d.setDate(d.getDate() - 10 + i);
+            return d.toISOString().slice(0, 10);
+          })
         ),
       ]);
-      const statsById = new Map(statsResults.filter((r) => r.stats).map((r) => [r.id, r.stats!]));
-      const fallbackGoalsById = new Map(
-        fallbackTimelineResults
-          .filter(r => r.goals.home.length > 0 || r.goals.away.length > 0)
-          .map(r => [r.id, r.goals])
-      );
-
-      const matches = matchesBase.map((m) => {
-        const fromTimeline = m.theSportsDbId ? fallbackGoalsById.get(m.theSportsDbId) : undefined;
-        const goalScorers = m.goalScorers ?? (
-          fromTimeline && (fromTimeline.home.length > 0 || fromTimeline.away.length > 0)
-            ? fromTimeline
-            : null
-        );
-        return {
-          ...m,
-          goalScorers,
-          liveStats:
-            m.status === "LIVE" || m.status === "FINISHED"
-              ? statsById.get(m.theSportsDbId ?? "") ?? null
-              : null,
-        };
-      });
-
-      return { matches, source: "live" };
+      const matches = await buildSdbOnlyMatches(sdbMap, espnMap);
+      if (matches.length > 0) {
+        const providers = [
+          `thesportsdb:${activeSdbApiKey}`,
+          ...(espnMap.size > 0 ? ["espn"] : []),
+        ];
+        return { matches, source: "live", providers };
+      }
     } catch (err2) {
-      logger.error({ err2 }, "All fetches failed");
-      return { matches: [], source: "static" };
+      logger.error({ err2 }, "SDB+ESPN fallback failed");
     }
+    if (stale) return { matches: stale.matches, source: "cache", providers: ["cache"] };
+    return { matches: [], source: "static", providers: [] };
   }
 }
 
@@ -1048,12 +1308,18 @@ router.get("/copa2026/scores", async (_req, res) => {
     res.json({ ...mainCache.data, source: "cache" });
     return;
   }
-  const { matches, source } = await buildAllMatches();
-  const responseData = { matches, updatedAt: new Date().toISOString(), source };
+  const { matches, source, providers } = await buildAllMatches();
   if (matches.length > 0) {
-    mainCache = { data: responseData, expiresAt: now + MAIN_TTL };
+    persistMainCache(matches, source === "cache" ? "cache" : "live");
+    res.json({ matches, updatedAt: new Date().toISOString(), source, providers });
+    return;
   }
-  res.json(responseData);
+  const stale = getStaleScoresResponse();
+  if (stale) {
+    res.json({ ...stale, providers: ["cache"] });
+    return;
+  }
+  res.json({ matches: [], updatedAt: new Date().toISOString(), source: "static", providers: [] });
 });
 
 router.get("/copa2026/standings", async (_req, res) => {
@@ -1064,13 +1330,22 @@ router.get("/copa2026/standings", async (_req, res) => {
   }
 
   let matches: Match[];
-  if (mainCache && now < mainCache.expiresAt) {
+  if (mainCache && now < mainCache.expiresAt && mainCache.data.matches.length > 0) {
     matches = mainCache.data.matches;
   } else {
     const result = await buildAllMatches();
     matches = result.matches;
-    const responseData = { matches, updatedAt: new Date().toISOString(), source: result.source };
-    mainCache = { data: responseData, expiresAt: now + MAIN_TTL };
+    if (matches.length > 0) {
+      persistMainCache(matches, result.source === "cache" ? "cache" : "live");
+    } else {
+      const stale = getStaleScoresResponse();
+      if (stale) matches = stale.matches;
+    }
+  }
+
+  if (matches.length === 0) {
+    res.json([]);
+    return;
   }
 
   const standings = computeStandings(matches);
@@ -1135,8 +1410,10 @@ async function buildTopScorersFromSdbTimelines(matches: Match[]): Promise<TopSco
   const relevant = matches.filter(
     m => (m.status === "FINISHED" || m.status === "LIVE") && m.theSportsDbId
   );
-  const timelines = await Promise.all(
-    relevant.map(m => fetchSdbTimeline(m.theSportsDbId!).then(t => ({ match: m, timeline: t })))
+  const timelines = await mapPool(
+    relevant,
+    async m => ({ match: m, timeline: await fetchSdbTimeline(m.theSportsDbId!) }),
+    6
   );
 
   const playerMap = new Map<string, { team: string; teamFlag: string; goals: number; assists: number; photo: string | null }>();
@@ -1182,38 +1459,58 @@ router.get("/copa2026/topscorers", async (_req, res) => {
     return;
   }
 
+  const respondWithScorers = (scorers: TopScorer[]) => {
+    if (scorers.length > 0) {
+      topScorersCache = { data: scorers, expiresAt: now + TOPSCORERS_TTL };
+      staleTopScorersCache = { data: scorers, expiresAt: now + STALE_TOPSCORERS_TTL };
+    }
+    res.json(scorers);
+  };
+
   try {
-    // Use warm main cache; otherwise fetch fresh
     let matches: Match[];
-    if (mainCache && now < mainCache.expiresAt) {
+    if (mainCache && now < mainCache.expiresAt && mainCache.data.matches.length > 0) {
       matches = mainCache.data.matches;
     } else {
       const result = await buildAllMatches();
       matches = result.matches;
-      const responseData = { matches, updatedAt: new Date().toISOString(), source: result.source };
-      mainCache = { data: responseData, expiresAt: now + MAIN_TTL };
+      if (matches.length > 0) {
+        persistMainCache(matches, result.source === "cache" ? "cache" : "live");
+      } else {
+        const stale = getStaleScoresResponse();
+        if (stale) matches = stale.matches;
+      }
+    }
+
+    if (matches.length === 0) {
+      if (staleTopScorersCache && now < staleTopScorersCache.expiresAt) {
+        res.json(staleTopScorersCache.data);
+        return;
+      }
+      res.json([]);
+      return;
     }
 
     const finishedWithSdbId = matches.filter(
       m => (m.status === "FINISHED" || m.status === "LIVE") && m.theSportsDbId
     );
 
-    // Step 1: resolve api-sports fixture IDs from TheSportsDB in parallel
-    const fixtureIdResults = await Promise.all(
-      finishedWithSdbId.map(async m => ({
+    const fixtureIdResults = await mapPool(
+      finishedWithSdbId,
+      async m => ({
         match: m,
         fixtureId: await fetchSdbApiFootballId(m.theSportsDbId!),
-      }))
+      }),
+      6
     );
 
-    // Step 2: fetch goal events from api-sports in parallel
-    const goalResults = await Promise.all(
-      fixtureIdResults
-        .filter(r => r.fixtureId)
-        .map(async r => ({
-          match: r.match,
-          goals: await fetchGoalsFromApiSports(r.fixtureId!),
-        }))
+    const goalResults = await mapPool(
+      fixtureIdResults.filter(r => r.fixtureId),
+      async r => ({
+        match: r.match,
+        goals: await fetchGoalsFromApiSports(r.fixtureId!),
+      }),
+      6
     );
 
     // Step 3: aggregate goals per player
@@ -1255,17 +1552,30 @@ router.get("/copa2026/topscorers", async (_req, res) => {
         ? timelineScorers
         : buildTopScorersFromMatches(matches);
 
-    topScorersCache = { data: finalScorers, expiresAt: now + TOPSCORERS_TTL };
-    res.json(finalScorers);
+    respondWithScorers(finalScorers);
   } catch (err) {
     logger.warn({ err }, "top scorers fetch failed");
     try {
-      const result = await buildAllMatches();
-      const timelineScorers = await buildTopScorersFromSdbTimelines(result.matches);
-      res.json(timelineScorers.length > 0 ? timelineScorers : buildTopScorersFromMatches(result.matches));
-    } catch {
-      res.json([]);
+      const stale = getStaleScoresResponse();
+      const matches = stale?.matches ?? (await buildAllMatches()).matches;
+      const timelineScorers = matches.length > 0
+        ? await buildTopScorersFromSdbTimelines(matches)
+        : [];
+      const fallback = timelineScorers.length > 0
+        ? timelineScorers
+        : buildTopScorersFromMatches(matches);
+      if (fallback.length > 0) {
+        respondWithScorers(fallback);
+        return;
+      }
+    } catch (err2) {
+      logger.error({ err2 }, "top scorers fallback failed");
     }
+    if (staleTopScorersCache && Date.now() < staleTopScorersCache.expiresAt) {
+      res.json(staleTopScorersCache.data);
+      return;
+    }
+    res.json([]);
   }
 });
 
@@ -1277,7 +1587,15 @@ router.get("/copa2026/bracket", async (_req, res) => {
   }
 
   try {
-    const allMatches = await fetchFdFixtures(true);
+    const allMatches = await fetchFdFixturesSafe(true);
+    if (!allMatches || allMatches.length === 0) {
+      if (bracketCache) {
+        res.json(bracketCache.data);
+        return;
+      }
+      res.json([]);
+      return;
+    }
     const knockout = allMatches
       .filter(m => m.stage !== "GROUP_STAGE" && m.stage !== "PLAYOFF_ROUND_ONE" && m.stage !== "PRELIMINARY_ROUND")
       .map(m => {
@@ -1305,6 +1623,10 @@ router.get("/copa2026/bracket", async (_req, res) => {
     res.json(knockout);
   } catch (err) {
     logger.warn({ err }, "bracket fetch failed");
+    if (bracketCache) {
+      res.json(bracketCache.data);
+      return;
+    }
     res.json([]);
   }
 });
@@ -1407,10 +1729,10 @@ router.get("/copa2026/match/:eventId/stats", async (req, res) => {
 
   try {
     const [statsRes, lineupRes] = await Promise.all([
-      fetch(`https://www.thesportsdb.com/api/v1/json/3/lookupeventstats.php?id=${eventId}`, {
+      fetch(sdbApiUrl(`lookupeventstats.php?id=${eventId}`), {
         signal: AbortSignal.timeout(5000),
       }),
-      fetch(`https://www.thesportsdb.com/api/v1/json/3/lookuplineup.php?id=${eventId}`, {
+      fetch(sdbApiUrl(`lookuplineup.php?id=${eventId}`), {
         signal: AbortSignal.timeout(5000),
       }),
     ]);

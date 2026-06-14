@@ -4,6 +4,8 @@ import { useGetCopa2026TopScorers, getGetCopa2026TopScorersQueryKey } from "@wor
 import type { TopScorer } from "@workspace/api-client-react";
 import { Target } from "lucide-react";
 
+const SCORERS_CACHE_KEY = "copa2026_topscorers_cache";
+
 function PlayerPhoto({ photo, name }: { photo: string | null; name: string }) {
   const [err, setErr] = React.useState(false);
   const initials = name.split(" ").map(w => w[0]).slice(0, 2).join("").toUpperCase();
@@ -35,11 +37,29 @@ function RankBadge({ rank }: { rank: number }) {
 }
 
 export function TopScorers() {
-  const { data, isLoading } = useGetCopa2026TopScorers({
+  const [cachedScorers, setCachedScorers] = React.useState<TopScorer[] | null>(null);
+
+  React.useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SCORERS_CACHE_KEY);
+      if (raw) setCachedScorers(JSON.parse(raw));
+    } catch { /* noop */ }
+  }, []);
+
+  const { data, isLoading, isError } = useGetCopa2026TopScorers({
     query: { queryKey: getGetCopa2026TopScorersQueryKey(), refetchInterval: 300_000 }
   });
 
-  if (isLoading) {
+  React.useEffect(() => {
+    if (Array.isArray(data) && data.length > 0) {
+      try {
+        localStorage.setItem(SCORERS_CACHE_KEY, JSON.stringify(data));
+        setCachedScorers(data);
+      } catch { /* noop */ }
+    }
+  }, [data]);
+
+  if (isLoading && !cachedScorers) {
     return (
       <div className="max-w-2xl mx-auto space-y-3">
         {Array.from({ length: 10 }).map((_, i) => (
@@ -49,7 +69,8 @@ export function TopScorers() {
     );
   }
 
-  const scorers = (data as TopScorer[] | undefined) ?? [];
+  const scorers = (Array.isArray(data) && data.length > 0 ? data : cachedScorers) ?? [];
+  const isFallback = isError || (!data?.length && !!cachedScorers?.length);
 
   if (scorers.length === 0) {
     return (
@@ -63,6 +84,11 @@ export function TopScorers() {
 
   return (
     <div className="max-w-2xl mx-auto space-y-4">
+      {isFallback && (
+        <p className="text-center text-xs text-amber-500/90 mb-2">
+          Dados em cache — reconectando…
+        </p>
+      )}
       {scorers.length >= 3 && (
         <div className="grid grid-cols-3 gap-2 mb-6 items-end pt-2">
           {[scorers[1], scorers[0], scorers[2]].map((scorer, i) => {

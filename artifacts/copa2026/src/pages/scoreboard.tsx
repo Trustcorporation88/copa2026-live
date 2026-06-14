@@ -59,7 +59,7 @@ export default function Scoreboard() {
   }, [queryClient]);
 
   useEffect(() => {
-    if (apiData) {
+    if (apiData && (apiData.matches?.length ?? 0) > 0) {
       try {
         localStorage.setItem("copa2026_cache", JSON.stringify(apiData));
         setCachedData(apiData);
@@ -67,8 +67,13 @@ export default function Scoreboard() {
     }
   }, [apiData]);
 
-  const data = apiData || cachedData;
-  const isFallback = isError || (!apiData && !!cachedData);
+  const liveApiData = apiData && (apiData.matches?.length ?? 0) > 0 ? apiData : null;
+  const data = liveApiData || cachedData;
+  const providers = (apiData as { providers?: string[] } | undefined)?.providers;
+  const isFallback =
+    isError ||
+    apiData?.source === "cache" ||
+    (!liveApiData && !!cachedData);
 
   const filteredMatches = useMemo(() => {
     if (!data?.matches) return [];
@@ -123,7 +128,11 @@ export default function Scoreboard() {
   return (
     <div className="min-h-screen bg-background text-foreground pb-20">
       <SiteHeader
-        subtitle="Copa do Mundo 2026 · Placares ao vivo"
+        subtitle={
+          providers?.length
+            ? `Copa 2026 · ${providers.join(" + ")}`
+            : "Copa do Mundo 2026 · Placares ao vivo"
+        }
         lastSyncText={lastSyncText}
         isFallback={isFallback}
         isFetching={isFetching}
