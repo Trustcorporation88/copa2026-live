@@ -12,6 +12,7 @@ interface MatchCardProps {
   match: Copa2026Match & { theSportsDbId?: string | null };
   index: number;
   onClick: () => void;
+  featured?: boolean;
 }
 
 function useScoreFlash(score: number | null) {
@@ -104,7 +105,7 @@ function LiveStatsRow({
   );
 }
 
-export function MatchCard({ match, index, onClick }: MatchCardProps) {
+export function MatchCard({ match, index, onClick, featured = false }: MatchCardProps) {
   const isLive = match.status === "LIVE";
   const isFinished = match.status === "FINISHED";
   const isPending = match.status === "PENDING";
@@ -128,10 +129,11 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
         aria-label={`${match.homeTeam.name} vs ${match.awayTeam.name} — ver detalhes`}
       >
         <Card className={`h-full border bg-card hover:border-primary/60 hover:shadow-[0_0_20px_rgba(255,215,0,0.12)] active:scale-[0.98] transition-all duration-200 relative overflow-hidden group cursor-pointer
-          ${isLive ? "border-red-500/50 shadow-[0_0_24px_rgba(239,68,68,0.12)]" : "border-border"}`}>
+          ${isLive ? "border-red-500/50 shadow-[0_0_24px_rgba(239,68,68,0.12)]" : "border-border"}
+          ${featured ? "shadow-[0_0_32px_rgba(239,68,68,0.18)]" : ""}`}>
           <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none" />
 
-          <CardContent className="p-4 flex flex-col h-full">
+          <CardContent className={`flex flex-col h-full ${featured ? "p-5" : "p-4"}`}>
             <div className="flex justify-between items-start mb-3">
               <Badge variant="outline" className="text-xs bg-background/50 border-border text-muted-foreground uppercase tracking-wider font-semibold">
                 Grupo {match.group}
@@ -163,7 +165,7 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
               <div className="flex justify-between items-center gap-2">
                 <div className="flex items-center gap-2 min-w-0">
                   <TeamBadge badge={(match.homeTeam as { badge?: string | null }).badge} flag={match.homeTeam.flag} name={match.homeTeam.name} />
-                  <span className="font-semibold text-sm sm:text-base leading-tight truncate">{match.homeTeam.name}</span>
+                  <span className={`font-semibold leading-tight truncate ${featured ? "text-base" : "text-sm sm:text-base"}`}>{match.homeTeam.name}</span>
                 </div>
                 <AnimatePresence mode="popLayout">
                   <motion.span
@@ -171,7 +173,7 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
                     initial={homeFlashKey > 0 ? { scale: 1.4, color: "#FFD700", textShadow: "0 0 16px #FFD70088" } : false}
                     animate={{ scale: 1, color: "var(--color-primary)", textShadow: "none" }}
                     transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
-                    className="text-2xl font-black tabular-nums text-primary shrink-0"
+                    className={`font-black tabular-nums text-primary shrink-0 ${featured ? "text-3xl" : "text-2xl"}`}
                   >
                     {match.homeScore !== null ? match.homeScore : "—"}
                   </motion.span>
@@ -191,7 +193,7 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
               <div className="flex justify-between items-center gap-2">
                 <div className="flex items-center gap-2 min-w-0">
                   <TeamBadge badge={(match.awayTeam as { badge?: string | null }).badge} flag={match.awayTeam.flag} name={match.awayTeam.name} />
-                  <span className="font-semibold text-sm sm:text-base leading-tight truncate">{match.awayTeam.name}</span>
+                  <span className={`font-semibold leading-tight truncate ${featured ? "text-base" : "text-sm sm:text-base"}`}>{match.awayTeam.name}</span>
                 </div>
                 <AnimatePresence mode="popLayout">
                   <motion.span
@@ -199,7 +201,7 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
                     initial={awayFlashKey > 0 ? { scale: 1.4, color: "#FFD700", textShadow: "0 0 16px #FFD70088" } : false}
                     animate={{ scale: 1, color: "var(--color-primary)", textShadow: "none" }}
                     transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
-                    className="text-2xl font-black tabular-nums text-primary shrink-0"
+                    className={`font-black tabular-nums text-primary shrink-0 ${featured ? "text-3xl" : "text-2xl"}`}
                   >
                     {match.awayScore !== null ? match.awayScore : "—"}
                   </motion.span>

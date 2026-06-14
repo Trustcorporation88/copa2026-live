@@ -239,9 +239,9 @@ export default function Scoreboard() {
                 </button>
               </div>
             ) : (
-              <>
+              <div className={liveMatches.length > 0 ? "flex flex-col lg:flex-row lg:items-start gap-6 lg:gap-8" : ""}>
                 {liveMatches.length > 0 && (
-                  <section className="mb-8">
+                  <aside className="w-full lg:w-[min(100%,360px)] shrink-0 lg:sticky lg:top-[11.5rem]">
                     <div className="flex items-center gap-2 mb-4">
                       <span className="relative flex h-2.5 w-2.5">
                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75" />
@@ -251,27 +251,28 @@ export default function Scoreboard() {
                         Ao vivo agora ({liveMatches.length})
                       </h2>
                     </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="flex flex-col gap-4">
                       {liveMatches.map((match, index) => (
                         <MatchCard
                           key={match.id}
                           match={match}
                           index={index}
+                          featured={liveMatches.length === 1}
                           onClick={() => handleMatchClick(match)}
                         />
                       ))}
                     </div>
-                  </section>
+                  </aside>
                 )}
 
                 {otherMatches.length > 0 && (
-                  <section>
+                  <section className="flex-1 min-w-0">
                     {liveMatches.length > 0 && (
                       <h2 className="text-sm font-bold uppercase tracking-wider text-muted-foreground mb-4">
                         Outras partidas
                       </h2>
                     )}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
                       {otherMatches.map((match, index) => (
                         <MatchCard
                           key={match.id}
@@ -283,7 +284,13 @@ export default function Scoreboard() {
                     </div>
                   </section>
                 )}
-              </>
+
+                {liveMatches.length > 0 && otherMatches.length === 0 && (
+                  <p className="hidden lg:block flex-1 text-sm text-muted-foreground pt-2">
+                    Nenhuma outra partida neste filtro — acompanhe o jogo ao vivo ao lado.
+                  </p>
+                )}
+              </div>
             )}
           </>
         )}
