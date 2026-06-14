@@ -149,6 +149,7 @@ interface SdbEvent {
   idEvent: string;
   strHomeTeam: string;
   strAwayTeam: string;
+  strLeague?: string;
   intHomeScore: string | null;
   intAwayScore: string | null;
   strStatus: string;
@@ -450,6 +451,47 @@ async function supplementSdbMap(map: Map<string, SdbEvent>, dates: string[]): Pr
   }
 }
 
+async function searchSdbEvent(homeEn: string, awayEn: string): Promise<SdbEvent | null> {
+  const query = `${canonical(homeEn)}_vs_${canonical(awayEn)}`;
+  try {
+    const r = await fetch(
+      `https://www.thesportsdb.com/api/v1/json/3/searchevents.php?e=${encodeURIComponent(query)}`,
+      { signal: AbortSignal.timeout(4000) }
+    );
+    if (!r.ok) return null;
+    const j = await r.json() as { event?: SdbEvent[] };
+    const ev = (j.event ?? []).find(e => e.strLeague === "FIFA World Cup" || (e as { idLeague?: string }).idLeague === "4429");
+    return ev ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve SDB events missing from season/day feeds via per-match search. */
+async function resolveMissingSdbEvents(map: Map<string, SdbEvent>, fdMatches: FdMatch[]): Promise<void> {
+  const now = Date.now();
+  const windowMs = 21 * 24 * 60 * 60 * 1000;
+  const needsSearch = fdMatches.filter(m => {
+    const key = sdbEventKey(m.homeTeam.name ?? "", m.awayTeam.name ?? "");
+    if (map.has(key)) return false;
+    const t = new Date(m.utcDate ?? 0).getTime();
+    return Math.abs(t - now) <= windowMs;
+  });
+  if (needsSearch.length === 0) return;
+
+  const found = await Promise.all(
+    needsSearch.map(async m => {
+      const home = m.homeTeam.name ?? "";
+      const away = m.awayTeam.name ?? "";
+      const ev = await searchSdbEvent(home, away);
+      return ev ? { key: sdbEventKey(home, away), ev } : null;
+    })
+  );
+  for (const item of found) {
+    if (item && !map.has(item.key)) map.set(item.key, item.ev);
+  }
+}
+
 function parseScore(val: string | number | null | undefined): number | null {
   if (val == null || val === "") return null;
   const n = typeof val === "number" ? val : parseInt(String(val), 10);
@@ -603,6 +645,7 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
     const [fdMatches, sdbMap] = await Promise.all([fetchFdFixtures(), fetchSdbScores()]);
     const fixtureDates = fdMatches.map(m => (m.utcDate ?? "").slice(0, 10));
     await supplementSdbMap(sdbMap, fixtureDates);
+    await resolveMissingSdbEvents(sdbMap, fdMatches);
 
     const initialMatches = fdMatches.map((fdm, idx) => {
       const homeEn = fdm.homeTeam.name ?? "";
