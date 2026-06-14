@@ -265,6 +265,31 @@ function buildTopScorersFromMatches(matches: Match[]): TopScorer[] {
     .map((s, i) => ({ ...s, rank: i + 1 }));
 }
 
+function mergeTopScorerLists(lists: TopScorer[][]): TopScorer[] {
+  const map = new Map<string, TopScorer>();
+  for (const list of lists) {
+    for (const s of list) {
+      const existing = map.get(s.player);
+      if (!existing) {
+        map.set(s.player, { ...s });
+        continue;
+      }
+      const goals = Math.max(existing.goals, s.goals);
+      const assists = Math.max(existing.assists, s.assists);
+      const prefer = s.goals > existing.goals ? s : existing;
+      map.set(s.player, {
+        ...prefer,
+        goals,
+        assists,
+        photo: existing.photo ?? s.photo ?? null,
+      });
+    }
+  }
+  return [...map.values()]
+    .sort((a, b) => b.goals - a.goals || b.assists - a.assists || a.player.localeCompare(b.player))
+    .map((s, i) => ({ ...s, rank: i + 1 }));
+}
+
 interface SdbEventDetail {
   idEvent: string;
   idAPIfootball?: string | null;
@@ -1610,18 +1635,10 @@ router.get("/copa2026/topscorers", async (_req, res) => {
   };
 
   try {
-    let matches: Match[];
-    if (mainCache && now < mainCache.expiresAt && mainCache.data.matches.length > 0) {
-      matches = mainCache.data.matches;
-    } else {
-      const result = await buildAllMatches();
-      matches = result.matches;
-      if (matches.length > 0) {
-        persistMainCache(matches, result.source === "cache" ? "cache" : "live");
-      } else {
-        const stale = getStaleScoresResponse();
-        if (stale) matches = stale.matches;
-      }
+    const result = await buildAllMatches();
+    const matches = result.matches;
+    if (matches.length > 0) {
+      persistMainCache(matches, result.source === "cache" ? "cache" : "live");
     }
 
     if (matches.length === 0) {
@@ -1687,25 +1704,23 @@ router.get("/copa2026/topscorers", async (_req, res) => {
       .sort((a, b) => b.goals - a.goals || a.player.localeCompare(b.player))
       .map((s, i) => ({ ...s, rank: i + 1 }));
 
+    const fromMatches = buildTopScorersFromMatches(matches);
     const timelineScorers = await buildTopScorersFromSdbTimelines(matches);
-    const finalScorers = scorers.length > 0
-      ? scorers
-      : timelineScorers.length > 0
-        ? timelineScorers
-        : buildTopScorersFromMatches(matches);
+    const finalScorers = mergeTopScorerLists([fromMatches, timelineScorers, scorers]);
 
     respondWithScorers(finalScorers);
   } catch (err) {
     logger.warn({ err }, "top scorers fetch failed");
     try {
-      const stale = getStaleScoresResponse();
-      const matches = stale?.matches ?? (await buildAllMatches()).matches;
+      const result = await buildAllMatches();
+      const matches = result.matches.length > 0
+        ? result.matches
+        : (getStaleScoresResponse()?.matches ?? []);
+      const fromMatches = buildTopScorersFromMatches(matches);
       const timelineScorers = matches.length > 0
         ? await buildTopScorersFromSdbTimelines(matches)
         : [];
-      const fallback = timelineScorers.length > 0
-        ? timelineScorers
-        : buildTopScorersFromMatches(matches);
+      const fallback = mergeTopScorerLists([fromMatches, timelineScorers]);
       if (fallback.length > 0) {
         respondWithScorers(fallback);
         return;
