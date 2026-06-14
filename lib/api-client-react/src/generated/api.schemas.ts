@@ -30,6 +30,7 @@ export const Copa2026MatchStatus = {
 
 export interface Copa2026MatchLiveStats {
   shotsOnGoal: [number, number];
+  totalShots?: [number, number];
   cornerKicks: [number, number];
   yellowCards: [number, number];
 }

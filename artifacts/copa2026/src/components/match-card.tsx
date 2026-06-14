@@ -5,7 +5,7 @@ import { ptBR } from "date-fns/locale";
 import type { Copa2026Match } from "@workspace/api-client-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Crosshair, Flag } from "lucide-react";
+import { Crosshair, Target } from "lucide-react";
 
 interface MatchCardProps {
   match: Copa2026Match & { theSportsDbId?: string | null };
@@ -34,20 +34,25 @@ function useScoreFlash(score: number | null) {
 function LiveStatsRow({
   stats,
 }: {
-  stats?: { shotsOnGoal: [number, number]; cornerKicks: [number, number]; yellowCards: [number, number] } | null;
+  stats?: {
+    shotsOnGoal: [number, number];
+    totalShots?: [number, number];
+    cornerKicks: [number, number];
+    yellowCards: [number, number];
+  } | null;
 }) {
   if (!stats) return null;
-  const s = stats.shotsOnGoal;
-  const c = stats.cornerKicks;
+  const onTarget = stats.shotsOnGoal;
+  const total = stats.totalShots ?? stats.shotsOnGoal;
   return (
     <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
       <div className="flex items-center gap-1" title="Chutes a Gol">
         <Crosshair className="w-3 h-3" />
-        <span className="tabular-nums">{s[0]}-{s[1]}</span>
+        <span className="tabular-nums">{onTarget[0]}-{onTarget[1]}</span>
       </div>
       <div className="flex items-center gap-1" title="Total de Chutes">
-        <Flag className="w-3 h-3" />
-        <span className="tabular-nums">{c[0]}-{c[1]}</span>
+        <Target className="w-3 h-3" />
+        <span className="tabular-nums">{total[0]}-{total[1]}</span>
       </div>
     </div>
   );

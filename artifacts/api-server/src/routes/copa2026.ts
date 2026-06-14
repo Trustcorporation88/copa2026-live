@@ -121,6 +121,7 @@ interface Match {
   goalScorers: { home: string[]; away: string[] } | null;
   liveStats?: {
     shotsOnGoal: [number, number];
+    totalShots: [number, number];
     cornerKicks: [number, number];
     yellowCards: [number, number];
   } | null;
@@ -166,6 +167,46 @@ function parseGoalScorers(details: string | null | undefined): string[] {
     .split(";")
     .map(s => s.trim())
     .filter(Boolean);
+}
+
+function parsePlayerNameFromGoalDetail(detail: string): string {
+  return detail.trim().replace(/\s+\d+(?:\+\d+)?['′]?\s*$/, "");
+}
+
+function buildTopScorersFromMatches(matches: Match[]): TopScorer[] {
+  const playerMap = new Map<string, { team: string; teamFlag: string; goals: number }>();
+
+  for (const m of matches) {
+    if (!m.goalScorers) continue;
+    for (const detail of m.goalScorers.home) {
+      const name = parsePlayerNameFromGoalDetail(detail);
+      if (!name) continue;
+      const existing = playerMap.get(name);
+      if (existing) existing.goals++;
+      else playerMap.set(name, { team: m.homeTeam.name, teamFlag: m.homeTeam.flag, goals: 1 });
+    }
+    for (const detail of m.goalScorers.away) {
+      const name = parsePlayerNameFromGoalDetail(detail);
+      if (!name) continue;
+      const existing = playerMap.get(name);
+      if (existing) existing.goals++;
+      else playerMap.set(name, { team: m.awayTeam.name, teamFlag: m.awayTeam.flag, goals: 1 });
+    }
+  }
+
+  return [...playerMap.entries()]
+    .map(([player, info]) => ({
+      rank: 0,
+      player,
+      photo: null,
+      team: info.team,
+      teamFlag: info.teamFlag,
+      goals: info.goals,
+      assists: 0,
+      appearances: 0,
+    }))
+    .sort((a, b) => b.goals - a.goals || a.player.localeCompare(b.player))
+    .map((s, i) => ({ ...s, rank: i + 1 }));
 }
 
 interface SdbEventDetail {
@@ -372,6 +413,7 @@ async function fetchSdbStatsOnly(sdbId: string): Promise<Match["liveStats"]> {
 
     return {
       shotsOnGoal: [getHome("Shots on Goal"), getAway("Shots on Goal")],
+      totalShots: [getHome("Total Shots"), getAway("Total Shots")],
       cornerKicks: [getHome("Corner Kicks"), getAway("Corner Kicks")],
       yellowCards: [getHome("Yellow Cards"), getAway("Yellow Cards")],
     };
@@ -404,6 +446,10 @@ async function fetchLiveStatsOnly(afId: string, afKey: string): Promise<Match["l
         getVal(home.statistics, "Shots on Goal"),
         getVal(away.statistics, "Shots on Goal"),
       ],
+      totalShots: [
+        getVal(home.statistics, "Total Shots"),
+        getVal(away.statistics, "Total Shots"),
+      ],
       cornerKicks: [
         getVal(home.statistics, "Corner Kicks"),
         getVal(away.statistics, "Corner Kicks"),
@@ -434,11 +480,12 @@ async function mergeStats(
 
   // Prefer SDB for shots-on-goal (more reliable), fallback to api-sports
   // Prefer api-sports for corners and yellow cards (if available)
-  const sdb = sdbStats || { shotsOnGoal: [0, 0], cornerKicks: [0, 0], yellowCards: [0, 0] };
-  const af = afStats || { shotsOnGoal: [0, 0], cornerKicks: [0, 0], yellowCards: [0, 0] };
+  const sdb = sdbStats || { shotsOnGoal: [0, 0], totalShots: [0, 0], cornerKicks: [0, 0], yellowCards: [0, 0] };
+  const af = afStats || { shotsOnGoal: [0, 0], totalShots: [0, 0], cornerKicks: [0, 0], yellowCards: [0, 0] };
 
   return {
     shotsOnGoal: sdbStats ? sdb.shotsOnGoal : af.shotsOnGoal,
+    totalShots: sdbStats ? sdb.totalShots : af.totalShots,
     cornerKicks: afStats ? af.cornerKicks : sdb.cornerKicks,
     yellowCards: afStats ? af.yellowCards : sdb.yellowCards,
   };
@@ -506,23 +553,34 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
     for (const { id, detail } of liveDetailResults) liveDetails.set(id, detail);
     for (const { id, detail } of finishedDetailResults) liveDetails.set(id, detail);
 
-    // Fetch stats for all live and finished matches
-    // Prefer TheSportsDB for shots (reliable), api-sports for corners/cards (rate-limited)
-    const afKey = process.env.API_FOOTBALL_KEY ?? "";
+    // Fetch stats from TheSportsDB in parallel (fast, no API key needed)
     if (statsMatches.length > 0) {
-      // Resolve api-sports IDs one by one to avoid rate limits
-      const afIdResults = [];
-      for (const m of statsMatches) {
-        const afId = await fetchSdbApiFootballId(m.theSportsDbId!);
-        afIdResults.push({ id: m.theSportsDbId!, afId });
-        // Rate-limit: wait 1s between ID lookups
-        await new Promise(r => setTimeout(r, 1000));
+      const sdbStatsResults = await Promise.all(
+        statsMatches.map(async (m) => ({
+          id: m.theSportsDbId!,
+          stats: await fetchSdbStatsOnly(m.theSportsDbId!),
+        }))
+      );
+      for (const r of sdbStatsResults) {
+        if (r.stats) liveStatsMap.set(r.id, r.stats);
       }
-      // Fetch stats sequentially to avoid rate limit (10/min)
-      for (const r of afIdResults) {
-        const stats = await mergeStats(r.id, r.afId, afKey);
-        if (stats) liveStatsMap.set(r.id, stats);
-        await new Promise(res => setTimeout(res, 1000));
+
+      // Enrich live matches with api-sports corners/cards when key is available
+      const afKey = process.env.API_FOOTBALL_KEY ?? "";
+      if (afKey) {
+        for (const m of statsMatches.filter((x) => x.status === "LIVE")) {
+          const afId = await fetchSdbApiFootballId(m.theSportsDbId!);
+          if (!afId) continue;
+          const afStats = await fetchLiveStatsOnly(afId, afKey);
+          const existing = liveStatsMap.get(m.theSportsDbId!);
+          if (existing && afStats) {
+            liveStatsMap.set(m.theSportsDbId!, {
+              ...existing,
+              cornerKicks: afStats.cornerKicks,
+              yellowCards: afStats.yellowCards,
+            });
+          }
+        }
       }
     }
 
@@ -560,7 +618,7 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
     try {
       const sdbMap = await fetchSdbScores();
       const now = new Date();
-      const matches: Match[] = [...sdbMap.values()].map((ev, idx) => {
+      const matchesBase: Match[] = [...sdbMap.values()].map((ev, idx) => {
         const homeEn = ev.strHomeTeam;
         const awayEn = ev.strAwayTeam;
         const hs = ev.intHomeScore != null ? parseInt(ev.intHomeScore, 10) : null;
@@ -590,8 +648,29 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
           thumbnail: ev.strThumb ?? null,
           minute: status === "LIVE" ? extractMinute(ev, null) : null,
           goalScorers: hasGoalData ? { home: homeGoals, away: awayGoals } : null,
+          liveStats: null,
         };
       });
+
+      const statsMatches = matchesBase.filter(
+        (m) => (m.status === "LIVE" || m.status === "FINISHED") && m.theSportsDbId
+      );
+      const statsResults = await Promise.all(
+        statsMatches.map(async (m) => ({
+          id: m.theSportsDbId!,
+          stats: await fetchSdbStatsOnly(m.theSportsDbId!),
+        }))
+      );
+      const statsById = new Map(statsResults.filter((r) => r.stats).map((r) => [r.id, r.stats!]));
+
+      const matches = matchesBase.map((m) => ({
+        ...m,
+        liveStats:
+          m.status === "LIVE" || m.status === "FINISHED"
+            ? statsById.get(m.theSportsDbId ?? "") ?? null
+            : null,
+      }));
+
       return { matches, source: "live" };
     } catch (err2) {
       logger.error({ err2 }, "All fetches failed");
@@ -667,7 +746,7 @@ function computeStandings(matches: Match[]): GroupStanding[] {
 router.get("/copa2026/scores", async (_req, res) => {
   const now = Date.now();
   // Force a fresh build if stats schema changed (liveStats may not exist in old cache)
-  if (mainCache && now < mainCache.expiresAt && (mainCache.data.matches?.[0]?.liveStats !== undefined)) {
+  if (mainCache && now < mainCache.expiresAt && (mainCache.data.matches?.[0]?.liveStats?.totalShots !== undefined)) {
     res.json({ ...mainCache.data, source: "cache" });
     return;
   }
@@ -825,11 +904,18 @@ router.get("/copa2026/topscorers", async (_req, res) => {
       .sort((a, b) => b.goals - a.goals || a.player.localeCompare(b.player))
       .map((s, i) => ({ ...s, rank: i + 1 }));
 
-    topScorersCache = { data: scorers, expiresAt: now + TOPSCORERS_TTL };
-    res.json(scorers);
+    const finalScorers = scorers.length > 0 ? scorers : buildTopScorersFromMatches(matches);
+
+    topScorersCache = { data: finalScorers, expiresAt: now + TOPSCORERS_TTL };
+    res.json(finalScorers);
   } catch (err) {
     logger.warn({ err }, "top scorers fetch failed");
-    res.json([]);
+    try {
+      const result = await buildAllMatches();
+      res.json(buildTopScorersFromMatches(result.matches));
+    } catch {
+      res.json([]);
+    }
   }
 });
 
