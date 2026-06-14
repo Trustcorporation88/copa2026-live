@@ -425,6 +425,7 @@ const ESPN_TO_CANONICAL: Record<string, string> = {
 
 interface EspnScoreEntry {
   espnEventId: string | null;
+  homeEspnTeamId: string | null;
   homeTeam: string;
   awayTeam: string;
   homeScore: number | null;
@@ -484,7 +485,52 @@ function goalScorersFromEspnDetails(
   return { home, away };
 }
 
-async function fetchEspnMatchStats(espnEventId: string): Promise<Match["liveStats"] | null> {
+function goalScorersFromEspnKeyEvents(
+  keyEvents: Array<{
+    scoringPlay?: boolean;
+    team?: { id?: string };
+    participants?: Array<{ athlete?: { displayName?: string } }>;
+    clock?: { displayValue?: string };
+    type?: { text?: string };
+  }>,
+  homeTeamId: string
+): { home: string[]; away: string[] } {
+  const home: string[] = [];
+  const away: string[] = [];
+  for (const e of keyEvents) {
+    if (!e.scoringPlay) continue;
+    const type = e.type?.text ?? "";
+    if (!/goal|penalty/i.test(type)) continue;
+    const player = e.participants?.[0]?.athlete?.displayName?.trim();
+    if (!player) continue;
+    const minute = e.clock?.displayValue ?? "";
+    const entry = minute ? `${player} ${minute}` : player;
+    if (String(e.team?.id) === homeTeamId) home.push(entry);
+    else away.push(entry);
+  }
+  return { home, away };
+}
+
+function mergeGoalScorers(
+  ...sources: Array<{ home: string[]; away: string[] } | null | undefined>
+): { home: string[]; away: string[] } {
+  let best = { home: [] as string[], away: [] as string[] };
+  let bestCount = 0;
+  for (const src of sources) {
+    if (!src) continue;
+    const count = src.home.length + src.away.length;
+    if (count > bestCount) {
+      best = src;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
+async function fetchEspnMatchSummary(
+  espnEventId: string,
+  homeTeamId: string
+): Promise<{ liveStats: Match["liveStats"]; goalScorers: { home: string[]; away: string[] } } | null> {
   try {
     const res = await fetchWithRetry(
       `https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event=${espnEventId}`,
@@ -502,42 +548,57 @@ async function fetchEspnMatchStats(espnEventId: string): Promise<Match["liveStat
           statistics?: Array<{ name?: string; displayValue?: string | number }>;
         }>;
       };
+      keyEvents?: Array<{
+        scoringPlay?: boolean;
+        team?: { id?: string };
+        participants?: Array<{ athlete?: { displayName?: string } }>;
+        clock?: { displayValue?: string };
+        type?: { text?: string };
+      }>;
     };
     const teams = json.boxscore?.teams ?? [];
-    if (teams.length < 2) return null;
-    const home = teams.find(t => t.homeAway === "home") ?? teams[0];
-    const away = teams.find(t => t.homeAway === "away") ?? teams[1];
-    const getStat = (
-      team: (typeof teams)[number] | undefined,
-      name: string
-    ): number => {
-      const raw = team?.statistics?.find(s => s.name === name)?.displayValue;
-      if (raw == null) return 0;
-      return typeof raw === "number" ? raw : parseInt(String(raw), 10) || 0;
-    };
-    return {
-      shotsOnGoal: [getStat(home, "shotsOnTarget"), getStat(away, "shotsOnTarget")],
-      totalShots: [getStat(home, "totalShots"), getStat(away, "totalShots")],
-      cornerKicks: [getStat(home, "wonCorners"), getStat(away, "wonCorners")],
-      yellowCards: [getStat(home, "yellowCards"), getStat(away, "yellowCards")],
-    };
+    let liveStats: Match["liveStats"] = null;
+    if (teams.length >= 2) {
+      const home = teams.find(t => t.homeAway === "home") ?? teams[0];
+      const away = teams.find(t => t.homeAway === "away") ?? teams[1];
+      const getStat = (
+        team: (typeof teams)[number] | undefined,
+        name: string
+      ): number => {
+        const raw = team?.statistics?.find(s => s.name === name)?.displayValue;
+        if (raw == null) return 0;
+        return typeof raw === "number" ? raw : parseInt(String(raw), 10) || 0;
+      };
+      liveStats = {
+        shotsOnGoal: [getStat(home, "shotsOnTarget"), getStat(away, "shotsOnTarget")],
+        totalShots: [getStat(home, "totalShots"), getStat(away, "totalShots")],
+        cornerKicks: [getStat(home, "wonCorners"), getStat(away, "wonCorners")],
+        yellowCards: [getStat(home, "yellowCards"), getStat(away, "yellowCards")],
+      };
+    }
+    const goalScorers = goalScorersFromEspnKeyEvents(json.keyEvents ?? [], homeTeamId);
+    if (!liveStats && goalScorers.home.length === 0 && goalScorers.away.length === 0) return null;
+    return { liveStats, goalScorers };
   } catch (err) {
-    logger.warn({ err, espnEventId }, "ESPN match stats fetch failed");
+    logger.warn({ err, espnEventId }, "ESPN match summary fetch failed");
     return null;
   }
 }
 
 async function enrichEspnWithStats(map: Map<string, EspnScoreEntry>): Promise<void> {
   const targets = [...map.values()].filter(
-    e => e.espnEventId && (e.status === "LIVE" || e.status === "FINISHED") && !e.liveStats
+    e => e.espnEventId && e.homeEspnTeamId && (e.status === "LIVE" || e.status === "FINISHED")
   );
   if (targets.length === 0) return;
   const results = await mapPool(targets, async entry => ({
     entry,
-    stats: await fetchEspnMatchStats(entry.espnEventId!),
+    summary: await fetchEspnMatchSummary(entry.espnEventId!, entry.homeEspnTeamId!),
   }), 4);
-  for (const { entry, stats } of results) {
-    if (stats) entry.liveStats = stats;
+  for (const { entry, summary } of results) {
+    if (!summary) continue;
+    if (summary.liveStats) entry.liveStats = summary.liveStats;
+    const merged = mergeGoalScorers(entry.goalScorers, summary.goalScorers);
+    if (merged.home.length > 0 || merged.away.length > 0) entry.goalScorers = merged;
   }
 }
 
@@ -592,6 +653,7 @@ async function fetchEspnScoresForDates(dates: string[]): Promise<Map<string, Esp
         const hasGoals = goalScorers && (goalScorers.home.length > 0 || goalScorers.away.length > 0);
         entries.push({
           espnEventId: ev.id ?? null,
+          homeEspnTeamId: String(homeC?.team?.id ?? ""),
           homeTeam: homeCanon,
           awayTeam: awayCanon,
           homeScore: hs,
@@ -1020,16 +1082,12 @@ async function buildSdbOnlyMatches(
     }
     const homeGoals = parseGoalScorers(ev.strHomeGoalDetails);
     const awayGoals = parseGoalScorers(ev.strAwayGoalDetails);
-    const espnGoals = espnEv?.goalScorers;
-    const hasGoalData =
-      homeGoals.length > 0 || awayGoals.length > 0 ||
-      (espnGoals != null && (espnGoals.home.length > 0 || espnGoals.away.length > 0));
-    const goalScorers = hasGoalData
-      ? {
-          home: homeGoals.length > 0 ? homeGoals : (espnGoals?.home ?? []),
-          away: awayGoals.length > 0 ? awayGoals : (espnGoals?.away ?? []),
-        }
-      : null;
+    const mergedGoals = mergeGoalScorers(
+      homeGoals.length > 0 || awayGoals.length > 0 ? { home: homeGoals, away: awayGoals } : null,
+      espnEv?.goalScorers
+    );
+    const goalScorers =
+      mergedGoals.home.length > 0 || mergedGoals.away.length > 0 ? mergedGoals : null;
     return {
       id: ev.idEvent,
       matchNumber: idx + 1,
@@ -1045,7 +1103,7 @@ async function buildSdbOnlyMatches(
       theSportsDbId: ev.idEvent,
       thumbnail: ev.strThumb ?? null,
       minute: status === "LIVE" ? (espnEv?.minute ?? extractMinute(ev, null)) : null,
-      goalScorers: goalScorers && (goalScorers.home.length > 0 || goalScorers.away.length > 0) ? goalScorers : null,
+      goalScorers,
       liveStats: espnEv?.liveStats ?? null,
     };
   });
@@ -1260,17 +1318,14 @@ async function buildAllMatches(): Promise<{
       const goalAwayDetails = detail?.strAwayGoalDetails ?? sdbEv?.strAwayGoalDetails;
       let homeGoals = parseGoalScorers(goalHomeDetails);
       let awayGoals = parseGoalScorers(goalAwayDetails);
-      if (homeGoals.length === 0 && awayGoals.length === 0 && theSportsDbId) {
-        const fromTimeline = timelineGoalsMap.get(theSportsDbId);
-        if (fromTimeline) {
-          homeGoals = fromTimeline.home;
-          awayGoals = fromTimeline.away;
-        }
-      }
-      if (homeGoals.length === 0 && awayGoals.length === 0 && espnEv?.goalScorers) {
-        homeGoals = espnEv.goalScorers.home;
-        awayGoals = espnEv.goalScorers.away;
-      }
+      const fromTimeline = theSportsDbId ? timelineGoalsMap.get(theSportsDbId) : undefined;
+      const merged = mergeGoalScorers(
+        homeGoals.length > 0 || awayGoals.length > 0 ? { home: homeGoals, away: awayGoals } : null,
+        fromTimeline,
+        espnEv?.goalScorers
+      );
+      homeGoals = merged.home;
+      awayGoals = merged.away;
       const hasGoalData = homeGoals.length > 0 || awayGoals.length > 0;
 
       return {
