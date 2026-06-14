@@ -482,13 +482,12 @@ async function searchSdbEvent(homeEn: string, awayEn: string): Promise<SdbEvent 
 /** Resolve SDB events missing from season/day feeds via per-match search. */
 async function resolveMissingSdbEvents(map: Map<string, SdbEvent>, fdMatches: FdMatch[]): Promise<void> {
   const now = Date.now();
-  const windowMs = 21 * 24 * 60 * 60 * 1000;
   const needsSearch = fdMatches.filter(m => {
     const key = sdbEventKey(m.homeTeam.name ?? "", m.awayTeam.name ?? "");
     if (map.has(key)) return false;
     const t = new Date(m.utcDate ?? 0).getTime();
-    return Math.abs(t - now) <= windowMs;
-  });
+    return Math.abs(t - now) <= 10 * 24 * 60 * 60 * 1000;
+  }).slice(0, 16);
   if (needsSearch.length === 0) return;
 
   const batchSize = 8;
@@ -968,14 +967,15 @@ function computeStandings(matches: Match[]): GroupStanding[] {
 
 router.get("/copa2026/scores", async (_req, res) => {
   const now = Date.now();
-  // Force a fresh build if stats schema changed (liveStats may not exist in old cache)
-  if (mainCache && now < mainCache.expiresAt && (mainCache.data.matches?.[0]?.liveStats?.totalShots !== undefined)) {
+  if (mainCache && now < mainCache.expiresAt && mainCache.data.matches.length > 0) {
     res.json({ ...mainCache.data, source: "cache" });
     return;
   }
   const { matches, source } = await buildAllMatches();
   const responseData = { matches, updatedAt: new Date().toISOString(), source };
-  mainCache = { data: responseData, expiresAt: now + MAIN_TTL };
+  if (matches.length > 0) {
+    mainCache = { data: responseData, expiresAt: now + MAIN_TTL };
+  }
   res.json(responseData);
 });
 
