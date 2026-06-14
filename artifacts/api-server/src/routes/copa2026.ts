@@ -421,32 +421,44 @@ async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
 
 /** Season bulk feed is often incomplete — merge per-day World Cup events. */
 async function supplementSdbMap(map: Map<string, SdbEvent>, dates: string[]): Promise<void> {
-  const unique = [...new Set(dates.filter(Boolean))];
+  const now = new Date();
+  const from = new Date(now);
+  from.setDate(from.getDate() - 14);
+  const to = new Date(now);
+  to.setDate(to.getDate() + 7);
+
+  const unique = [...new Set(dates.filter(d => {
+    const t = new Date(d).getTime();
+    return t >= from.getTime() && t <= to.getTime();
+  }))];
   if (unique.length === 0) return;
 
-  const results = await Promise.all(
-    unique.map(async (date) => {
-      try {
-        const r = await fetch(
-          `https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=${date}&s=Soccer`,
-          { signal: AbortSignal.timeout(5000) }
-        );
-        if (!r.ok) return [] as SdbEvent[];
-        const j = await r.json() as { events?: SdbEvent[] };
-        return (j.events ?? []).filter(
-          ev => ev.strLeague === "FIFA World Cup" || (ev as { idLeague?: string }).idLeague === "4429"
-        );
-      } catch {
-        return [] as SdbEvent[];
+  const batchSize = 6;
+  for (let i = 0; i < unique.length; i += batchSize) {
+    const batch = unique.slice(i, i + batchSize);
+    const results = await Promise.all(
+      batch.map(async (date) => {
+        try {
+          const r = await fetch(
+            `https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=${date}&s=Soccer`,
+            { signal: AbortSignal.timeout(5000) }
+          );
+          if (!r.ok) return [] as SdbEvent[];
+          const j = await r.json() as { events?: SdbEvent[] };
+          return (j.events ?? []).filter(
+            ev => ev.strLeague === "FIFA World Cup" || (ev as { idLeague?: string }).idLeague === "4429"
+          );
+        } catch {
+          return [] as SdbEvent[];
+        }
+      })
+    );
+    for (const events of results) {
+      for (const ev of events) {
+        if (!ev.strHomeTeam || !ev.strAwayTeam) continue;
+        const key = sdbEventKey(ev.strHomeTeam, ev.strAwayTeam);
+        if (!map.has(key)) map.set(key, ev);
       }
-    })
-  );
-
-  for (const events of results) {
-    for (const ev of events) {
-      if (!ev.strHomeTeam || !ev.strAwayTeam) continue;
-      const key = sdbEventKey(ev.strHomeTeam, ev.strAwayTeam);
-      if (!map.has(key)) map.set(key, ev);
     }
   }
 }
@@ -479,16 +491,20 @@ async function resolveMissingSdbEvents(map: Map<string, SdbEvent>, fdMatches: Fd
   });
   if (needsSearch.length === 0) return;
 
-  const found = await Promise.all(
-    needsSearch.map(async m => {
-      const home = m.homeTeam.name ?? "";
-      const away = m.awayTeam.name ?? "";
-      const ev = await searchSdbEvent(home, away);
-      return ev ? { key: sdbEventKey(home, away), ev } : null;
-    })
-  );
-  for (const item of found) {
-    if (item && !map.has(item.key)) map.set(item.key, item.ev);
+  const batchSize = 8;
+  for (let i = 0; i < needsSearch.length; i += batchSize) {
+    const batch = needsSearch.slice(i, i + batchSize);
+    const found = await Promise.all(
+      batch.map(async m => {
+        const home = m.homeTeam.name ?? "";
+        const away = m.awayTeam.name ?? "";
+        const ev = await searchSdbEvent(home, away);
+        return ev ? { key: sdbEventKey(home, away), ev } : null;
+      })
+    );
+    for (const item of found) {
+      if (item && !map.has(item.key)) map.set(item.key, item.ev);
+    }
   }
 }
 
