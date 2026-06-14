@@ -203,13 +203,8 @@ async function fetchSdbTimeline(eventId: string, ttl = TIMELINE_TTL): Promise<Sd
   if (cached && now < cached.expiresAt) return cached.data;
 
   try {
-    const res = await fetchWithRetry(
-      sdbApiUrl(`lookuptimeline.php?id=${eventId}`),
-      { signal: AbortSignal.timeout(5000) },
-      2
-    );
-    if (!res.ok) return [];
-    const json = await res.json() as { timeline?: SdbTimelineEntry[] };
+    const json = await fetchSdbJson<{ timeline?: SdbTimelineEntry[] }>(`lookuptimeline.php?id=${eventId}`, 8000);
+    if (!json) return [];
     const timeline = json.timeline ?? [];
     timelineCacheMap.set(eventId, { data: timeline, expiresAt: now + ttl });
     return timeline;
@@ -292,13 +287,8 @@ async function fetchLiveEventDetail(eventId: string, ttl = LIVE_DETAIL_TTL): Pro
   if (cached && now < cached.expiresAt) return cached.data;
 
   try {
-    const res = await fetchWithRetry(
-      sdbApiUrl(`lookupevent.php?id=${eventId}`),
-      { signal: AbortSignal.timeout(4000) },
-      2
-    );
-    if (!res.ok) return null;
-    const json = await res.json() as { events?: SdbEventDetail[] };
+    const json = await fetchSdbJson<{ events?: SdbEventDetail[] }>(`lookupevent.php?id=${eventId}`, 8000);
+    if (!json) return null;
     const detail = json.events?.[0] ?? null;
     if (!detail) return null;
     liveDetailCacheMap.set(eventId, { data: detail, expiresAt: now + ttl });
@@ -402,6 +392,24 @@ let activeSdbApiKey = SDB_API_KEYS[0] ?? "123";
 
 function sdbApiUrl(path: string): string {
   return `https://www.thesportsdb.com/api/v1/json/${activeSdbApiKey}/${path}`;
+}
+
+async function fetchSdbJson<T>(path: string, timeoutMs = 10_000): Promise<T | null> {
+  for (const apiKey of SDB_API_KEYS) {
+    try {
+      const res = await fetchWithRetry(
+        `https://www.thesportsdb.com/api/v1/json/${apiKey}/${path}`,
+        { signal: AbortSignal.timeout(timeoutMs) },
+        2
+      );
+      if (!res.ok) continue;
+      activeSdbApiKey = apiKey;
+      return await res.json() as T;
+    } catch (err) {
+      logger.warn({ err, apiKey, path }, "SDB request failed for key");
+    }
+  }
+  return null;
 }
 
 const ESPN_TO_CANONICAL: Record<string, string> = {
@@ -614,39 +622,20 @@ async function fetchFdFixturesSafe(allStages = false): Promise<FdMatch[] | null>
   }
 }
 
-async function fetchSdbScoresWithKey(apiKey: string): Promise<Map<string, SdbEvent>> {
-  const res = await fetchWithRetry(
-    `https://www.thesportsdb.com/api/v1/json/${apiKey}/eventsseason.php?id=4429&s=2026`,
-    { signal: AbortSignal.timeout(8000) },
-    2
+async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
+  const json = await fetchSdbJson<{ events?: SdbEvent[] }>(
+    "eventsseason.php?id=4429&s=2026",
+    12_000
   );
-  if (!res.ok) throw new Error(`SDB HTTP ${res.status} (key ${apiKey})`);
-  const json = await res.json() as { events?: SdbEvent[] };
+  if (!json) throw new Error("All SDB API keys failed");
   const map = new Map<string, SdbEvent>();
   for (const ev of (json.events ?? [])) {
     if (ev.strHomeTeam && ev.strAwayTeam) {
       map.set(sdbEventKey(ev.strHomeTeam, ev.strAwayTeam), ev);
     }
   }
+  if (map.size === 0) throw new Error("SDB season returned no events");
   return map;
-}
-
-async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
-  let best = new Map<string, SdbEvent>();
-  for (const apiKey of SDB_API_KEYS) {
-    try {
-      const map = await fetchSdbScoresWithKey(apiKey);
-      if (map.size > best.size) {
-        best = map;
-        activeSdbApiKey = apiKey;
-      }
-      if (map.size >= 48) break;
-    } catch (err) {
-      logger.warn({ err, apiKey }, "SDB season fetch failed for key");
-    }
-  }
-  if (best.size === 0) throw new Error("All SDB API keys failed");
-  return best;
 }
 
 async function fetchSdbScoresSafe(): Promise<Map<string, SdbEvent>> {
@@ -688,13 +677,11 @@ async function supplementSdbMap(map: Map<string, SdbEvent>, dates: string[]): Pr
     const results = await Promise.all(
       batch.map(async (date) => {
         try {
-          const r = await fetchWithRetry(
-            sdbApiUrl(`eventsday.php?d=${date}&s=Soccer`),
-            { signal: AbortSignal.timeout(5000) },
-            2
+          const j = await fetchSdbJson<{ events?: SdbEvent[] }>(
+            `eventsday.php?d=${date}&s=Soccer`,
+            8000
           );
-          if (!r.ok) return [] as SdbEvent[];
-          const j = await r.json() as { events?: SdbEvent[] };
+          if (!j) return [] as SdbEvent[];
           return (j.events ?? []).filter(
             ev => ev.strLeague === "FIFA World Cup" || (ev as { idLeague?: string }).idLeague === "4429"
           );
@@ -716,13 +703,11 @@ async function supplementSdbMap(map: Map<string, SdbEvent>, dates: string[]): Pr
 async function searchSdbEvent(homeEn: string, awayEn: string): Promise<SdbEvent | null> {
   const query = `${canonical(homeEn)}_vs_${canonical(awayEn)}`;
   try {
-    const r = await fetchWithRetry(
-      sdbApiUrl(`searchevents.php?e=${encodeURIComponent(query)}`),
-      { signal: AbortSignal.timeout(4000) },
-      2
+    const j = await fetchSdbJson<{ event?: SdbEvent[] }>(
+      `searchevents.php?e=${encodeURIComponent(query)}`,
+      8000
     );
-    if (!r.ok) return null;
-    const j = await r.json() as { event?: SdbEvent[] };
+    if (!j) return null;
     const ev = (j.event ?? []).find(e => e.strLeague === "FIFA World Cup" || (e as { idLeague?: string }).idLeague === "4429");
     return ev ?? null;
   } catch {
@@ -738,7 +723,7 @@ async function resolveMissingSdbEvents(map: Map<string, SdbEvent>, fdMatches: Fd
     if (map.has(key)) return false;
     const t = new Date(m.utcDate ?? 0).getTime();
     return Math.abs(t - now) <= 10 * 24 * 60 * 60 * 1000;
-  }).slice(0, 16);
+  }).slice(0, 28);
   if (needsSearch.length === 0) return;
 
   const batchSize = 8;
@@ -799,17 +784,46 @@ function extractMinute(sdbEv: SdbEvent | undefined, detail: SdbEventDetail | nul
   return null;
 }
 
+/** Resolve SDB event IDs for finished/live games — required for chutes/stats on cards. */
+async function resolveSdbIdsForActiveMatches(
+  rows: Array<{
+    homeEn: string;
+    awayEn: string;
+    theSportsDbId: string | null;
+    sdbEv?: SdbEvent;
+    status: "PENDING" | "LIVE" | "FINISHED";
+  }>,
+  sdbMap: Map<string, SdbEvent>
+): Promise<void> {
+  const missing = rows.filter(
+    m => (m.status === "LIVE" || m.status === "FINISHED") && !m.theSportsDbId
+  );
+  if (missing.length === 0) return;
+
+  const found = await mapPool(missing.slice(0, 28), async m => {
+    const key = sdbEventKey(m.homeEn, m.awayEn);
+    const cached = sdbMap.get(key);
+    if (cached) return { m, ev: cached };
+    const ev = await searchSdbEvent(m.homeEn, m.awayEn);
+    return ev ? { m, ev } : null;
+  }, 6);
+
+  for (const item of found) {
+    if (!item) continue;
+    const key = sdbEventKey(item.m.homeEn, item.m.awayEn);
+    if (!sdbMap.has(key)) sdbMap.set(key, item.ev);
+    item.m.theSportsDbId = item.ev.idEvent;
+    item.m.sdbEv = item.ev;
+  }
+}
+
 async function fetchSdbStatsOnly(sdbId: string): Promise<Match["liveStats"]> {
   try {
-    const r = await fetchWithRetry(
-      sdbApiUrl(`lookupeventstats.php?id=${sdbId}`),
-      { signal: AbortSignal.timeout(5000) },
-      2
+    const json = await fetchSdbJson<{ eventstats?: Array<{ strStat: string; intHome: string; intAway: string }> }>(
+      `lookupeventstats.php?id=${sdbId}`,
+      8000
     );
-    if (!r.ok) return null;
-    const json = await r.json() as {
-      eventstats?: Array<{ strStat: string; intHome: string; intAway: string }>
-    };
+    if (!json) return null;
     const stats = json.eventstats ?? [];
     const getVal = (statName: string): number => {
       const s = stats.find(x => x.strStat === statName);
@@ -1090,6 +1104,11 @@ async function buildAllMatches(): Promise<{
         theSportsDbId: sdbEv?.idEvent ?? null,
       };
     });
+
+    await resolveSdbIdsForActiveMatches(initialMatches, sdbMap);
+    if (sdbMap.size > 0 && !providers.some(p => p.startsWith("thesportsdb"))) {
+      providers.push(`thesportsdb:${activeSdbApiKey}`);
+    }
 
     const liveMatches = initialMatches.filter(m => m.status === "LIVE" && m.theSportsDbId);
     const statsMatches = initialMatches.filter(m => (m.status === "LIVE" || m.status === "FINISHED") && m.theSportsDbId);
@@ -1728,26 +1747,18 @@ router.get("/copa2026/match/:eventId/stats", async (req, res) => {
   }
 
   try {
-    const [statsRes, lineupRes] = await Promise.all([
-      fetch(sdbApiUrl(`lookupeventstats.php?id=${eventId}`), {
-        signal: AbortSignal.timeout(5000),
-      }),
-      fetch(sdbApiUrl(`lookuplineup.php?id=${eventId}`), {
-        signal: AbortSignal.timeout(5000),
-      }),
-    ]);
-
-    const statsJson = await statsRes.json() as {
-      eventstats?: Array<{ strStat: string; intHome: string; intAway: string; idApiFootball?: string }>;
-    };
-    const lineupJson = await lineupRes.json() as {
-      lineup?: Array<{
+    const [statsJson, lineupJson] = await Promise.all([
+      fetchSdbJson<{ eventstats?: Array<{ strStat: string; intHome: string; intAway: string; idApiFootball?: string }> }>(
+        `lookupeventstats.php?id=${eventId}`,
+        8000
+      ),
+      fetchSdbJson<{ lineup?: Array<{
         strPlayer: string; intSquadNumber: string; strPosition: string;
         strHome: string; strSubstitute: string;
-      }>;
-    };
+      }> }>(`lookuplineup.php?id=${eventId}`, 8000),
+    ]);
 
-    let stats = (statsJson.eventstats ?? []).map(s => ({
+    let stats = (statsJson?.eventstats ?? []).map(s => ({
       name: STAT_PT[s.strStat] ?? s.strStat,
       home: parseInt(s.intHome ?? "0", 10) || 0,
       away: parseInt(s.intAway ?? "0", 10) || 0,
