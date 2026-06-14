@@ -1,0 +1,12 @@
+# Deploy único: API + site estático via Dockerfile na raiz do repo.
+# No Railway: use APENAS 1 serviço com Root Directory = / (raiz).
+# Não use a importação automática de monorepo (cria 8 serviços).
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/api/healthz"
+healthcheckTimeout = 180
+restartPolicyType = "ON_FAILURE"

@@ -40,12 +40,24 @@ docker run -p 5000:5000 --env-file .env copa2026
 
 Aponte `seligaaqui.online` para o IP do servidor (porta 5000 ou nginx na frente).
 
-### Opção B — Railway / Render / Fly.io
+### Opção B — Railway (recomendado)
 
-1. Conecte o repo GitHub `Trustcorporation88/copa2026-live`
-2. Build: `pnpm install && pnpm build`
-3. Start: `pnpm start`
-4. Variáveis: `PORT`, `FOOTBALL_DATA_API_KEY`, `API_FOOTBALL_KEY`
+**Importante:** este repo é um monorepo. O Railway pode criar 8 serviços automaticamente — isso **falha**. Use **apenas 1 serviço**.
+
+1. Crie um **Empty Project** no Railway (não use “import monorepo”)
+2. **+ New** → **GitHub Repo** → `Trustcorporation88/copa2026-live`
+3. Branch: `Trustcorporation88/córtex`
+4. **Settings** do serviço:
+   - **Root Directory:** vazio (raiz `/`)
+   - O `railway.toml` + `Dockerfile` na raiz fazem o build
+5. **Variables:**
+   - `NODE_ENV` = `production`
+   - `FOOTBALL_DATA_API_KEY` = sua chave
+   - `API_FOOTBALL_KEY` = sua chave
+6. **Networking** → **Generate Domain**
+7. Teste: `https://SEU-DOMINIO.up.railway.app/api/healthz`
+
+Se já criou 8 serviços por engano: apague todos e repita os passos acima com 1 serviço só.
 
 ### Opção C — Manter domínio atual
 
