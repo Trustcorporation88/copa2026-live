@@ -9,9 +9,14 @@ const FD_TO_CANONICAL: Record<string, string> = {
   "Czechia": "Czech Republic",
   "United States": "USA",
   "Cape Verde Islands": "Cape Verde",
+  "Côte d'Ivoire": "Ivory Coast",
 };
 function canonical(fdName: string): string {
   return FD_TO_CANONICAL[fdName] ?? fdName;
+}
+
+function sdbEventKey(home: string, away: string): string {
+  return `${canonical(home)}|${canonical(away)}`;
 }
 
 const PT_NAME: Record<string, string> = {
@@ -407,25 +412,73 @@ async function fetchSdbScores(): Promise<Map<string, SdbEvent>> {
   const map = new Map<string, SdbEvent>();
   for (const ev of (json.events ?? [])) {
     if (ev.strHomeTeam && ev.strAwayTeam) {
-      map.set(`${ev.strHomeTeam}|${ev.strAwayTeam}`, ev);
+      map.set(sdbEventKey(ev.strHomeTeam, ev.strAwayTeam), ev);
     }
   }
   return map;
 }
 
+/** Season bulk feed is often incomplete — merge per-day World Cup events. */
+async function supplementSdbMap(map: Map<string, SdbEvent>, dates: string[]): Promise<void> {
+  const unique = [...new Set(dates.filter(Boolean))];
+  if (unique.length === 0) return;
+
+  const results = await Promise.all(
+    unique.map(async (date) => {
+      try {
+        const r = await fetch(
+          `https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d=${date}&s=Soccer`,
+          { signal: AbortSignal.timeout(5000) }
+        );
+        if (!r.ok) return [] as SdbEvent[];
+        const j = await r.json() as { events?: SdbEvent[] };
+        return (j.events ?? []).filter(
+          ev => ev.strLeague === "FIFA World Cup" || (ev as { idLeague?: string }).idLeague === "4429"
+        );
+      } catch {
+        return [] as SdbEvent[];
+      }
+    })
+  );
+
+  for (const events of results) {
+    for (const ev of events) {
+      if (!ev.strHomeTeam || !ev.strAwayTeam) continue;
+      const key = sdbEventKey(ev.strHomeTeam, ev.strAwayTeam);
+      if (!map.has(key)) map.set(key, ev);
+    }
+  }
+}
+
+function parseScore(val: string | number | null | undefined): number | null {
+  if (val == null || val === "") return null;
+  const n = typeof val === "number" ? val : parseInt(String(val), 10);
+  return Number.isNaN(n) ? null : n;
+}
+
 function toStatus(
   fdStatus: string,
   utcDate: string,
-  sdbStatus?: string
+  sdbStatus?: string,
+  hasScore = false
 ): "PENDING" | "LIVE" | "FINISHED" {
+  const liveSdb = new Set(["1H", "2H", "HT", "ET", "BT", "P", "LIVE", "INT"]);
   if (sdbStatus === "FT" || sdbStatus === "AET" || sdbStatus === "PEN") return "FINISHED";
+  if (liveSdb.has(sdbStatus ?? "")) return "LIVE";
   if (fdStatus === "FINISHED") return "FINISHED";
   if (fdStatus === "IN_PLAY" || fdStatus === "PAUSED" || fdStatus === "SUSPENDED") return "LIVE";
-  if (sdbStatus && sdbStatus !== "NS" && sdbStatus !== "TBD" && sdbStatus !== "") return "LIVE";
+
   const diffMins = (Date.now() - new Date(utcDate).getTime()) / 60000;
-  if (diffMins < 0) return "PENDING";
-  if (diffMins < 120) return "LIVE";
-  return "FINISHED";
+  if (diffMins < -10) return "PENDING";
+
+  if (fdStatus === "TIMED" || fdStatus === "SCHEDULED") {
+    if (diffMins >= 0 && diffMins < 130) return "LIVE";
+    if (diffMins >= 130 && hasScore) return "FINISHED";
+    return "PENDING";
+  }
+
+  if (diffMins < 130) return "LIVE";
+  return hasScore ? "FINISHED" : "PENDING";
 }
 
 function extractMinute(sdbEv: SdbEvent | undefined, detail: SdbEventDetail | null): string | null {
@@ -548,15 +601,22 @@ async function mergeStats(
 async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "static" }> {
   try {
     const [fdMatches, sdbMap] = await Promise.all([fetchFdFixtures(), fetchSdbScores()]);
+    const fixtureDates = fdMatches.map(m => (m.utcDate ?? "").slice(0, 10));
+    await supplementSdbMap(sdbMap, fixtureDates);
 
     const initialMatches = fdMatches.map((fdm, idx) => {
       const homeEn = fdm.homeTeam.name ?? "";
       const awayEn = fdm.awayTeam.name ?? "";
-      const sdbEv = sdbMap.get(`${canonical(homeEn)}|${canonical(awayEn)}`);
+      const sdbEv = sdbMap.get(sdbEventKey(homeEn, awayEn));
 
-      const rawHs = sdbEv?.intHomeScore != null ? parseInt(sdbEv.intHomeScore, 10) : null;
-      const rawAs = sdbEv?.intAwayScore != null ? parseInt(sdbEv.intAwayScore, 10) : null;
-      const status = toStatus(fdm.status ?? "", fdm.utcDate ?? "", sdbEv?.strStatus);
+      const sdbHs = parseScore(sdbEv?.intHomeScore);
+      const sdbAs = parseScore(sdbEv?.intAwayScore);
+      const fdHs = fdm.score?.fullTime?.home ?? null;
+      const fdAs = fdm.score?.fullTime?.away ?? null;
+      const rawHs = sdbHs ?? fdHs;
+      const rawAs = sdbAs ?? fdAs;
+      const hasScore = rawHs !== null && rawAs !== null;
+      const status = toStatus(fdm.status ?? "", fdm.utcDate ?? "", sdbEv?.strStatus, hasScore);
 
       return {
         idx,
@@ -690,6 +750,13 @@ async function buildAllMatches(): Promise<{ matches: Match[]; source: "live" | "
     logger.warn({ err }, "Primary fetch failed, falling back to SDB only");
     try {
       const sdbMap = await fetchSdbScores();
+      const today = new Date();
+      const recentDates = Array.from({ length: 14 }, (_, i) => {
+        const d = new Date(today);
+        d.setDate(d.getDate() - 7 + i);
+        return d.toISOString().slice(0, 10);
+      });
+      await supplementSdbMap(sdbMap, recentDates);
       const now = new Date();
       const matchesBase: Match[] = [...sdbMap.values()].map((ev, idx) => {
         const homeEn = ev.strHomeTeam;

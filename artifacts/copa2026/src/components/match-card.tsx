@@ -6,6 +6,7 @@ import type { Copa2026Match } from "@workspace/api-client-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Crosshair, Target, Flag, Square } from "lucide-react";
+import { flagCdnUrl, flagIsoForTeam } from "@/lib/team-flags";
 
 interface MatchCardProps {
   match: Copa2026Match & { theSportsDbId?: string | null };
@@ -32,14 +33,27 @@ function useScoreFlash(score: number | null) {
 }
 
 function TeamBadge({ badge, flag, name }: { badge?: string | null; flag: string; name: string }) {
-  const [err, setErr] = useState(false);
-  if (badge && !err) {
+  const [badgeErr, setBadgeErr] = useState(false);
+  const [flagErr, setFlagErr] = useState(false);
+  const iso = flagIsoForTeam(name);
+
+  if (badge && !badgeErr) {
     return (
       <img
         src={badge}
         alt=""
         className="w-6 h-6 object-contain shrink-0"
-        onError={() => setErr(true)}
+        onError={() => setBadgeErr(true)}
+      />
+    );
+  }
+  if (iso && !flagErr) {
+    return (
+      <img
+        src={flagCdnUrl(iso, 40)}
+        alt=""
+        className="w-6 h-4 object-cover rounded-sm shrink-0 border border-border/50"
+        onError={() => setFlagErr(true)}
       />
     );
   }
@@ -136,7 +150,11 @@ export function MatchCard({ match, index, onClick }: MatchCardProps) {
                     )}
                   </>
                 )}
-                {isFinished && <span className="text-xs font-bold text-green-500">ENCERRADO</span>}
+                {isFinished && (
+                  <span className="text-xs font-bold text-green-500">
+                    {match.homeScore !== null && match.awayScore !== null ? "ENCERRADO" : "SEM PLACAR"}
+                  </span>
+                )}
                 {isPending && <span className="text-xs font-bold text-muted-foreground">AGUARDANDO</span>}
               </div>
             </div>
