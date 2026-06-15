@@ -10,6 +10,7 @@ import type { Copa2026Match, Copa2026ScoresResponse } from "@workspace/api-clien
 import { useQueryClient } from "@tanstack/react-query";
 import { GroupStandings } from "@/components/group-standings";
 import { TopScorers } from "@/components/top-scorers";
+import { getCazetvWatchUrl, getCazetvWatchLabel } from "@/lib/cazetv";
 
 const GROUPS = ["Todos", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"];
 
@@ -460,9 +461,26 @@ function MobileMatchCard({ match, scoreChanged, isNewLive, onTap }: MobileMatchC
       )}
 
       {/* Footer */}
-      <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}60`, display: "flex", justifyContent: "space-between", fontSize: 10, color: C.pend }}>
+      <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}60`, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 10, color: C.pend }}>
         <span>{dateStr}</span>
-        <span title={match.venue} style={{ maxWidth: "55%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{match.venue}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+          <a
+            href={getCazetvWatchUrl(match)}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              color: C.live,
+              fontWeight: 700,
+              textDecoration: "none",
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
+          >
+            ▶ {getCazetvWatchLabel(match.status)}
+          </a>
+          <span title={match.venue} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{match.venue}</span>
+        </div>
       </div>
 
       {/* Tap chevron hint */}

@@ -5,8 +5,9 @@ import { ptBR } from "date-fns/locale";
 import type { Copa2026Match } from "@workspace/api-client-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Crosshair, Target, Flag, Square } from "lucide-react";
+import { Crosshair, Target, Flag, Square, Youtube } from "lucide-react";
 import { flagCdnUrl, flagIsoForTeam } from "@/lib/team-flags";
+import { getCazetvWatchUrl, getCazetvWatchLabel } from "@/lib/cazetv";
 
 interface MatchCardProps {
   match: Copa2026Match & { theSportsDbId?: string | null };
@@ -123,9 +124,12 @@ export function MatchCard({ match, index, onClick, featured = false }: MatchCard
       transition={{ duration: 0.4, delay: Math.min(index * 0.03, 0.6) }}
       className="h-full"
     >
-      <button
+      <div
+        role="button"
+        tabIndex={0}
         onClick={onClick}
-        className="w-full h-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-xl"
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } }}
+        className="w-full h-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-xl cursor-pointer"
         aria-label={`${match.homeTeam.name} vs ${match.awayTeam.name} — ver detalhes`}
       >
         <Card className={`h-full border bg-card hover:border-primary/60 hover:shadow-[0_0_20px_rgba(255,215,0,0.12)] active:scale-[0.98] transition-all duration-200 relative overflow-hidden group cursor-pointer
@@ -225,16 +229,44 @@ export function MatchCard({ match, index, onClick, featured = false }: MatchCard
               </div>
             )}
 
+            {featured && isLive && (
+              <a
+                href={getCazetvWatchUrl(match)}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className="mb-3 flex items-center justify-center gap-2 w-full py-2.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-bold transition-colors"
+              >
+                <Youtube className="w-4 h-4 shrink-0" />
+                Assistir ao vivo na CazéTV
+              </a>
+            )}
+
             <div className="mt-auto pt-3 border-t border-border/50 text-xs text-muted-foreground flex flex-col gap-1">
-              <div className="flex justify-between">
+              <div className="flex justify-between items-center gap-2">
                 <span>{format(parseISO(match.date), "dd/MM · EEE", { locale: ptBR })}</span>
-                <span className="text-primary/70 group-hover:text-primary transition-colors shrink-0">Ver stats →</span>
+                <div className="flex items-center gap-3 shrink-0">
+                  <a
+                    href={getCazetvWatchUrl(match)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    className={`inline-flex items-center gap-1 font-semibold transition-colors ${
+                      isLive ? "text-red-500 hover:text-red-400" : "text-red-500/80 hover:text-red-400"
+                    }`}
+                    title="Transmissão oficial da Copa no YouTube — CazéTV"
+                  >
+                    <Youtube className="w-3.5 h-3.5" />
+                    {getCazetvWatchLabel(match.status)}
+                  </a>
+                  <span className="text-primary/70">Ver stats →</span>
+                </div>
               </div>
               <div className="truncate" title={match.venue}>{match.venue}</div>
             </div>
           </CardContent>
         </Card>
-      </button>
+      </div>
     </motion.div>
   );
 }
