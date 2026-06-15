@@ -14,6 +14,7 @@ interface MatchCardProps {
   index: number;
   onClick: () => void;
   featured?: boolean;
+  kickoffLabel?: string;
 }
 
 function useScoreFlash(score: number | null) {
@@ -106,7 +107,7 @@ function LiveStatsRow({
   );
 }
 
-export function MatchCard({ match, index, onClick, featured = false }: MatchCardProps) {
+export function MatchCard({ match, index, onClick, featured = false, kickoffLabel }: MatchCardProps) {
   const isLive = match.status === "LIVE";
   const isFinished = match.status === "FINISHED";
   const isPending = match.status === "PENDING";
@@ -138,10 +139,17 @@ export function MatchCard({ match, index, onClick, featured = false }: MatchCard
           <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none" />
 
           <CardContent className={`flex flex-col h-full ${featured ? "p-5" : "p-4"}`}>
-            <div className="flex justify-between items-start mb-3">
-              <Badge variant="outline" className="text-xs bg-background/50 border-border text-muted-foreground uppercase tracking-wider font-semibold">
-                Grupo {match.group}
-              </Badge>
+            <div className="flex justify-between items-start mb-3 gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                {kickoffLabel && (
+                  <span className="text-sm font-black tabular-nums text-primary shrink-0">
+                    {kickoffLabel}
+                  </span>
+                )}
+                <Badge variant="outline" className="text-xs bg-background/50 border-border text-muted-foreground uppercase tracking-wider font-semibold">
+                  Grupo {match.group}
+                </Badge>
+              </div>
 
               <div className="flex items-center gap-1.5">
                 {isLive && (
@@ -244,7 +252,11 @@ export function MatchCard({ match, index, onClick, featured = false }: MatchCard
 
             <div className="mt-auto pt-3 border-t border-border/50 text-xs text-muted-foreground flex flex-col gap-1">
               <div className="flex justify-between items-center gap-2">
-                <span>{format(parseISO(match.date), "dd/MM · EEE", { locale: ptBR })}</span>
+                <span>
+                  {kickoffLabel
+                    ? `Hoje · ${kickoffLabel}`
+                    : format(parseISO(match.date), "dd/MM · EEE", { locale: ptBR })}
+                </span>
                 <div className="flex items-center gap-3 shrink-0">
                   <a
                     href={getCazetvWatchUrl(match)}

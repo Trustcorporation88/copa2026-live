@@ -11,6 +11,11 @@ import { useQueryClient } from "@tanstack/react-query";
 import { GroupStandings } from "@/components/group-standings";
 import { TopScorers } from "@/components/top-scorers";
 import { getCazetvWatchUrl, getCazetvWatchLabel } from "@/lib/cazetv";
+import {
+  formatKickoffBrazil,
+  formatTodaySectionLabel,
+  splitTodayAndOther,
+} from "@/lib/match-schedule";
 
 const GROUPS = ["Todos", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"];
 
@@ -130,22 +135,22 @@ export default function MobileScoreboard() {
 
   const filteredMatches = useMemo(() => {
     if (!data?.matches) return [];
-    const statusOrder = { LIVE: 0, FINISHED: 1, PENDING: 2 } as const;
-    return data.matches
-      .filter((m) => activeGroup === "Todos" ? true : m.group === activeGroup)
-      .sort((a, b) => {
-        const sa = statusOrder[a.status as keyof typeof statusOrder] ?? 3;
-        const sb = statusOrder[b.status as keyof typeof statusOrder] ?? 3;
-        if (sa !== sb) return sa - sb;
-        return new Date(b.date).getTime() - new Date(a.date).getTime();
-      });
+    return data.matches.filter((m) =>
+      activeGroup === "Todos" ? true : m.group === activeGroup
+    );
   }, [data, activeGroup]);
+
+  const { today: todayMatches, other: otherMatches } = useMemo(
+    () => splitTodayAndOther(filteredMatches),
+    [filteredMatches]
+  );
 
   const stats = useMemo(() => ({
     live:     filteredMatches.filter((m) => m.status === "LIVE").length,
+    today:    todayMatches.length,
     finished: filteredMatches.filter((m) => m.status === "FINISHED").length,
     pending:  filteredMatches.filter((m) => m.status === "PENDING").length,
-  }), [filteredMatches]);
+  }), [filteredMatches, todayMatches.length]);
 
   const lastSync = useMemo(() => {
     if (!data?.updatedAt) return "";
@@ -277,15 +282,47 @@ export default function MobileScoreboard() {
           </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {filteredMatches.map((match) => (
-              <MobileMatchCard
-                key={match.id}
-                match={match as ExtendedMatch}
-                scoreChanged={changedMatchIdsRef.current.has(match.id)}
-                isNewLive={newLiveMatchIdsRef.current.has(match.id)}
-                onTap={() => setSelectedMatch(match as ExtendedMatch)}
-              />
-            ))}
+            {todayMatches.length > 0 && (
+              <div style={{ marginBottom: 4 }}>
+                <div style={{ padding: "4px 2px 10px" }}>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: C.text }}>Jogos de hoje</div>
+                  <div style={{ fontSize: 11, color: C.muted, marginTop: 2, textTransform: "capitalize" }}>
+                    {formatTodaySectionLabel()} · Brasília
+                  </div>
+                </div>
+                {todayMatches.map((match) => (
+                  <div key={match.id} style={{ marginBottom: 10 }}>
+                    <MobileMatchCard
+                      match={match as ExtendedMatch}
+                      kickoffLabel={formatKickoffBrazil(match.date)}
+                      scoreChanged={changedMatchIdsRef.current.has(match.id)}
+                      isNewLive={newLiveMatchIdsRef.current.has(match.id)}
+                      onTap={() => setSelectedMatch(match as ExtendedMatch)}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {otherMatches.length > 0 && (
+              <div>
+                {todayMatches.length > 0 && (
+                  <div style={{ fontSize: 11, fontWeight: 700, color: C.muted, letterSpacing: "0.08em", textTransform: "uppercase", padding: "8px 2px 10px" }}>
+                    Outras partidas
+                  </div>
+                )}
+                {otherMatches.map((match) => (
+                  <div key={match.id} style={{ marginBottom: 10 }}>
+                    <MobileMatchCard
+                      match={match as ExtendedMatch}
+                      scoreChanged={changedMatchIdsRef.current.has(match.id)}
+                      isNewLive={newLiveMatchIdsRef.current.has(match.id)}
+                      onTap={() => setSelectedMatch(match as ExtendedMatch)}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
         </>
@@ -357,9 +394,10 @@ interface MobileMatchCardProps {
   scoreChanged: boolean;
   isNewLive: boolean;
   onTap: () => void;
+  kickoffLabel?: string;
 }
 
-function MobileMatchCard({ match, scoreChanged, isNewLive, onTap }: MobileMatchCardProps) {
+function MobileMatchCard({ match, scoreChanged, isNewLive, onTap, kickoffLabel }: MobileMatchCardProps) {
   const isLive     = match.status === "LIVE";
   const isFinished = match.status === "FINISHED";
 
@@ -394,9 +432,16 @@ function MobileMatchCard({ match, scoreChanged, isNewLive, onTap }: MobileMatchC
     >
       {/* Status badge */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-        <span style={{ fontSize: 10, fontWeight: 700, color: C.muted, letterSpacing: "0.1em", textTransform: "uppercase", background: C.bg, border: `1px solid ${C.border}`, borderRadius: 20, padding: "2px 8px" }}>
-          Grupo {match.group}
-        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {kickoffLabel && (
+            <span style={{ fontSize: 15, fontWeight: 900, color: C.gold, fontVariantNumeric: "tabular-nums" }}>
+              {kickoffLabel}
+            </span>
+          )}
+          <span style={{ fontSize: 10, fontWeight: 700, color: C.muted, letterSpacing: "0.1em", textTransform: "uppercase", background: C.bg, border: `1px solid ${C.border}`, borderRadius: 20, padding: "2px 8px" }}>
+            Grupo {match.group}
+          </span>
+        </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {isLive && match.minute && (
             <span style={{ fontSize: 11, fontWeight: 700, color: C.live, background: C.live + "18", border: `1px solid ${C.live}40`, borderRadius: 20, padding: "2px 8px" }}>
@@ -462,7 +507,7 @@ function MobileMatchCard({ match, scoreChanged, isNewLive, onTap }: MobileMatchC
 
       {/* Footer */}
       <div style={{ marginTop: 10, paddingTop: 8, borderTop: `1px solid ${C.border}60`, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 10, color: C.pend }}>
-        <span>{dateStr}</span>
+        <span>{kickoffLabel ? `Hoje · ${kickoffLabel}` : dateStr}</span>
         <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
           <a
             href={getCazetvWatchUrl(match)}

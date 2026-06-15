@@ -12,6 +12,11 @@ import { TopScorers } from "@/components/top-scorers";
 import { Bracket } from "@/components/bracket";
 import { SiteHeader } from "@/components/site-header";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  formatKickoffBrazil,
+  formatTodaySectionLabel,
+  splitTodayAndOther,
+} from "@/lib/match-schedule";
 import type { Copa2026ScoresResponse, Copa2026Match } from "@workspace/api-client-react";
 
 type ExtendedMatch = Copa2026Match & { theSportsDbId?: string | null };
@@ -77,36 +82,26 @@ export default function Scoreboard() {
 
   const filteredMatches = useMemo(() => {
     if (!data?.matches) return [];
-    const statusOrder = { LIVE: 0, FINISHED: 1, PENDING: 2 } as const;
-    return (data.matches as ExtendedMatch[])
-      .filter(match => {
-        const matchesGroup = activeGroup === "Todos" || match.group === activeGroup.replace("Grupo ", "");
-        const q = searchQuery.toLowerCase();
-        const matchesSearch = !q ||
-          match.homeTeam.name.toLowerCase().includes(q) ||
-          match.awayTeam.name.toLowerCase().includes(q);
-        return matchesGroup && matchesSearch;
-      })
-      .sort((a, b) => {
-        const sa = statusOrder[a.status as keyof typeof statusOrder] ?? 3;
-        const sb = statusOrder[b.status as keyof typeof statusOrder] ?? 3;
-        if (sa !== sb) return sa - sb;
-        return new Date(b.date).getTime() - new Date(a.date).getTime();
-      });
+    return (data.matches as ExtendedMatch[]).filter((match) => {
+      const matchesGroup =
+        activeGroup === "Todos" || match.group === activeGroup.replace("Grupo ", "");
+      const q = searchQuery.toLowerCase();
+      const matchesSearch =
+        !q ||
+        match.homeTeam.name.toLowerCase().includes(q) ||
+        match.awayTeam.name.toLowerCase().includes(q);
+      return matchesGroup && matchesSearch;
+    });
   }, [data, activeGroup, searchQuery]);
 
-  const liveMatches = useMemo(
-    () => filteredMatches.filter(m => m.status === "LIVE"),
-    [filteredMatches]
-  );
-
-  const otherMatches = useMemo(
-    () => filteredMatches.filter(m => m.status !== "LIVE"),
+  const { today: todayMatches, other: otherMatches } = useMemo(
+    () => splitTodayAndOther(filteredMatches),
     [filteredMatches]
   );
 
   const stats = useMemo(() => ({
     total: filteredMatches.length,
+    today: todayMatches.length,
     live: filteredMatches.filter(m => m.status === "LIVE").length,
     finished: filteredMatches.filter(m => m.status === "FINISHED").length,
     pending: filteredMatches.filter(m => m.status === "PENDING").length,
@@ -157,6 +152,11 @@ export default function Scoreboard() {
             <div className="flex items-center gap-2 text-xs overflow-x-auto scrollbar-hide">
               <span className="shrink-0 text-muted-foreground">
                 <span className="font-bold text-foreground">{stats.total}</span> partidas
+              </span>
+              <span className="text-border shrink-0">·</span>
+              <span className="flex items-center gap-1.5 shrink-0">
+                <span className="font-bold text-primary">{stats.today}</span>
+                <span className="text-muted-foreground">hoje</span>
               </span>
               <span className="text-border shrink-0">·</span>
               <span className="flex items-center gap-1.5 shrink-0">
@@ -239,39 +239,40 @@ export default function Scoreboard() {
                 </button>
               </div>
             ) : (
-              <div className={liveMatches.length > 0 ? "flex flex-col lg:flex-row lg:items-start gap-6 lg:gap-8" : ""}>
-                {liveMatches.length > 0 && (
-                  <aside className="w-full lg:w-[min(100%,360px)] shrink-0 lg:sticky lg:top-[11.5rem]">
-                    <div className="flex items-center gap-2 mb-4">
-                      <span className="relative flex h-2.5 w-2.5">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75" />
-                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500" />
-                      </span>
-                      <h2 className="text-sm font-bold uppercase tracking-wider text-red-500">
-                        Ao vivo agora ({liveMatches.length})
+              <div className="space-y-10">
+                {todayMatches.length > 0 && (
+                  <section>
+                    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-4">
+                      <h2 className="text-lg font-bold text-foreground">
+                        Jogos de hoje
                       </h2>
+                      <span className="text-sm text-muted-foreground capitalize">
+                        {formatTodaySectionLabel()} · horário de Brasília
+                      </span>
+                      <span className="text-xs font-semibold text-primary bg-primary/10 border border-primary/25 rounded-full px-2.5 py-0.5">
+                        {todayMatches.length} {todayMatches.length === 1 ? "jogo" : "jogos"}
+                      </span>
                     </div>
-                    <div className="flex flex-col gap-4">
-                      {liveMatches.map((match, index) => (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                      {todayMatches.map((match, index) => (
                         <MatchCard
                           key={match.id}
                           match={match}
                           index={index}
-                          featured={liveMatches.length === 1}
+                          kickoffLabel={formatKickoffBrazil(match.date)}
+                          featured={match.status === "LIVE"}
                           onClick={() => handleMatchClick(match)}
                         />
                       ))}
                     </div>
-                  </aside>
+                  </section>
                 )}
 
                 {otherMatches.length > 0 && (
-                  <section className="flex-1 min-w-0">
-                    {liveMatches.length > 0 && (
-                      <h2 className="text-sm font-bold uppercase tracking-wider text-muted-foreground mb-4">
-                        Outras partidas
-                      </h2>
-                    )}
+                  <section>
+                    <h2 className="text-sm font-bold uppercase tracking-wider text-muted-foreground mb-4">
+                      {todayMatches.length > 0 ? "Outras partidas" : "Todas as partidas"}
+                    </h2>
                     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
                       {otherMatches.map((match, index) => (
                         <MatchCard
@@ -283,12 +284,6 @@ export default function Scoreboard() {
                       ))}
                     </div>
                   </section>
-                )}
-
-                {liveMatches.length > 0 && otherMatches.length === 0 && (
-                  <p className="hidden lg:block flex-1 text-sm text-muted-foreground pt-2">
-                    Nenhuma outra partida neste filtro — acompanhe o jogo ao vivo ao lado.
-                  </p>
                 )}
               </div>
             )}
