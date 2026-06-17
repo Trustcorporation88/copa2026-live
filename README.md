@@ -10,12 +10,14 @@ Site de placares da Copa 2026 em tempo real. **Roda sem Replit.**
 ## Setup local (Windows)
 
 ```powershell
-cd C:\COPA2026\repo
-copy .env.example .env
-# Edite .env com suas API keys (copie do Replit Secrets se ainda tiver)
+cd C:\COPA2026\copa2026-live
+copy env.example .env
+# Edite .env com suas API keys
 pnpm install
 pnpm dev
 ```
+
+Arquivo de referência na raiz do repo: `env.example` (ou `.env.example` — mesmo conteúdo).
 
 - **Site:** http://localhost:5173  
 - **API:** http://localhost:5000/api/copa2026/scores  
@@ -50,10 +52,13 @@ Aponte `seligaaqui.online` para o IP do servidor (porta 5000 ou nginx na frente)
 4. **Settings** do serviço:
    - **Root Directory:** vazio (raiz `/`)
    - O `railway.toml` + `Dockerfile` na raiz fazem o build
-5. **Variables:**
+5. **Variables** (copie de `env.example` na raiz do repo):
    - `NODE_ENV` = `production`
    - `FOOTBALL_DATA_API_KEY` = sua chave
-   - `API_FOOTBALL_KEY` = sua chave
+   - `API_FOOTBALL_KEY` = sua chave Pro (api-sports.io)
+   - `API_FOOTBALL_LEAGUE_ID` = `1`
+   - `API_FOOTBALL_SEASON` = `2026`
+   - `THESPORTSDB_API_KEYS` = `123,3`
 6. **Networking** → **Generate Domain**
 7. Teste: `https://SEU-DOMINIO.up.railway.app/api/healthz`
 
@@ -65,12 +70,15 @@ No painel DNS de `seligaaqui.online`, troque o destino do Replit para seu novo s
 
 ## API keys necessárias
 
-| Variável | Onde obter |
-|----------|------------|
-| `FOOTBALL_DATA_API_KEY` | [football-data.org](https://www.football-data.org/) |
-| `API_FOOTBALL_KEY` | [api-football.com](https://www.api-football.com/) |
+| Variável | Obrigatória | Onde obter |
+|----------|-------------|------------|
+| `FOOTBALL_DATA_API_KEY` | Sim | [football-data.org](https://www.football-data.org/) |
+| `API_FOOTBALL_KEY` | Sim (stats ao vivo) | [api-football.com](https://www.api-football.com/) |
+| `API_FOOTBALL_LEAGUE_ID` | Não (padrão `1`) | ID da liga World Cup na API-Football |
+| `API_FOOTBALL_SEASON` | Não (padrão `2026`) | Temporada Copa |
+| `THESPORTSDB_API_KEYS` | Não (padrão `123,3`) | [TheSportsDB](https://www.thesportsdb.com/) — keys públicas |
 
-TheSportsDB é usado sem chave (tier gratuito).
+Modelo completo: `env.example` na raiz do repositório.
 
 ## Estrutura
 
