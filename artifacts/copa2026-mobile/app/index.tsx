@@ -31,7 +31,7 @@ export default function ScoreboardScreen() {
       refetchInterval: (query: any) => {
         const matches = query.state.data?.matches;
         const hasLive = Array.isArray(matches) && matches.some((m: any) => m.status === "LIVE");
-        return hasLive ? 30_000 : 60_000;
+        return hasLive ? 10_000 : 30_000;
       },
     } as any,
   });

@@ -54,7 +54,7 @@ export default function Scoreboard() {
       refetchInterval: (query) => {
         const matches = query.state.data?.matches;
         const hasLive = Array.isArray(matches) && matches.some((m) => m.status === "LIVE");
-        return hasLive ? 15_000 : 45_000;
+        return hasLive ? 10_000 : 30_000;
       },
     }
   });

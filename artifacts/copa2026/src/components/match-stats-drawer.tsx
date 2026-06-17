@@ -102,14 +102,39 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
       setStatsData(null);
       return;
     }
-    setLoading(true);
-    setError(false);
+
+    let cancelled = false;
     const base = import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
-    fetch(`${base}/api/copa2026/match/${match.theSportsDbId}/stats`)
-      .then(r => r.json())
-      .then((d: StatsData) => { setStatsData(d); setLoading(false); })
-      .catch(() => { setError(true); setLoading(false); });
-  }, [open, match?.theSportsDbId]);
+    const url = `${base}/api/copa2026/match/${match.theSportsDbId}/stats`;
+
+    const load = (showSpinner: boolean) => {
+      if (showSpinner) {
+        setLoading(true);
+        setError(false);
+      }
+      fetch(url)
+        .then(r => r.json())
+        .then((d: StatsData) => {
+          if (cancelled) return;
+          setStatsData(d);
+          setLoading(false);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setError(true);
+          setLoading(false);
+        });
+    };
+
+    load(true);
+    const pollMs = match.status === "LIVE" ? 20_000 : 0;
+    const timer = pollMs > 0 ? window.setInterval(() => load(false), pollMs) : undefined;
+
+    return () => {
+      cancelled = true;
+      if (timer) window.clearInterval(timer);
+    };
+  }, [open, match?.theSportsDbId, match?.status]);
 
   if (!match) return null;
 

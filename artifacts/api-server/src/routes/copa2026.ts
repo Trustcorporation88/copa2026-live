@@ -306,7 +306,7 @@ interface LiveDetailCache {
   expiresAt: number;
 }
 const liveDetailCacheMap = new Map<string, LiveDetailCache>();
-const LIVE_DETAIL_TTL = 30_000;
+const LIVE_DETAIL_TTL = 20_000;
 const FINISHED_DETAIL_TTL = 3_600_000; // 1 hour — finished matches never change
 
 async function fetchLiveEventDetail(eventId: string, ttl = LIVE_DETAIL_TTL): Promise<SdbEventDetail | null> {
@@ -334,7 +334,7 @@ interface MainCache {
 }
 let mainCache: MainCache | null = null;
 let staleMainCache: MainCache | null = null;
-const MAIN_TTL = 55_000;
+const MAIN_TTL = 30_000;
 const STALE_TTL = 1_800_000; // 30 min — last good payload when live fetch fails
 
 interface StatsCache {
@@ -342,7 +342,7 @@ interface StatsCache {
   expiresAt: number;
 }
 const statsCacheMap = new Map<string, StatsCache>();
-const STATS_TTL = 120_000;
+const STATS_TTL = 45_000;
 
 interface StandingsCache {
   data: GroupStanding[];
