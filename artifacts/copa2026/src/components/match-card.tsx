@@ -66,20 +66,19 @@ function TeamBadge({ badge, flag, name }: { badge?: string | null; flag: string;
 function LiveStatsRow({
   stats,
 }: {
-  stats?: {
-    shotsOnGoal: [number, number];
-    totalShots?: [number, number];
-    cornerKicks: [number, number];
-    yellowCards: [number, number];
-  } | null;
+  stats?: Copa2026Match["liveStats"];
 }) {
   if (!stats) return null;
   const onTarget = stats.shotsOnGoal;
   const total = stats.totalShots ?? stats.shotsOnGoal;
   const corners = stats.cornerKicks;
-  const cards = stats.yellowCards;
+  const yellows = stats.yellowCards;
+  const reds = stats.redCards;
+  const possession = stats.possession;
   const hasCorners = corners[0] > 0 || corners[1] > 0;
-  const hasCards = cards[0] > 0 || cards[1] > 0;
+  const hasYellows = yellows[0] > 0 || yellows[1] > 0;
+  const hasReds = reds && (reds[0] > 0 || reds[1] > 0);
+  const hasPossession = possession && (possession[0] > 0 || possession[1] > 0);
 
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted-foreground">
@@ -91,16 +90,28 @@ function LiveStatsRow({
         <Target className="w-3 h-3 text-primary/70" />
         <span className="tabular-nums font-medium">{total[0]}-{total[1]}</span>
       </div>
+      {hasPossession && (
+        <div className="flex items-center gap-1" title="Posse de Bola (%)">
+          <span className="text-[9px] opacity-70">Posse</span>
+          <span className="tabular-nums font-medium">{possession![0]}-{possession![1]}</span>
+        </div>
+      )}
       {hasCorners && (
         <div className="flex items-center gap-1" title="Escanteios">
           <Flag className="w-3 h-3 text-sky-400/80" />
           <span className="tabular-nums font-medium">{corners[0]}-{corners[1]}</span>
         </div>
       )}
-      {hasCards && (
+      {hasYellows && (
         <div className="flex items-center gap-1" title="Cartões Amarelos">
           <Square className="w-3 h-3 text-yellow-400 fill-yellow-400/80" />
-          <span className="tabular-nums font-medium">{cards[0]}-{cards[1]}</span>
+          <span className="tabular-nums font-medium">{yellows[0]}-{yellows[1]}</span>
+        </div>
+      )}
+      {hasReds && (
+        <div className="flex items-center gap-1" title="Cartões Vermelhos">
+          <Square className="w-3 h-3 text-red-500 fill-red-500/80" />
+          <span className="tabular-nums font-medium">{reds![0]}-{reds![1]}</span>
         </div>
       )}
     </div>

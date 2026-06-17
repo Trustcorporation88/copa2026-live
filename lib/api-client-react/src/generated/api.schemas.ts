@@ -33,6 +33,9 @@ export interface Copa2026MatchLiveStats {
   totalShots?: [number, number];
   cornerKicks: [number, number];
   yellowCards: [number, number];
+  redCards?: [number, number];
+  possession?: [number, number];
+  fouls?: [number, number];
 }
 
 export interface Copa2026Match {

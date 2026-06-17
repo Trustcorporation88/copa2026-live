@@ -129,6 +129,9 @@ interface Match {
     totalShots: [number, number];
     cornerKicks: [number, number];
     yellowCards: [number, number];
+    redCards?: [number, number];
+    possession?: [number, number];
+    fouls?: [number, number];
   } | null;
 }
 
@@ -970,6 +973,109 @@ async function resolveSdbIdsForActiveMatches(
   }
 }
 
+// ─── API-Football Pro (stats ao vivo) ───────────────────────────────────────
+
+const AF_NAME_TO_CANONICAL: Record<string, string> = {
+  "United States": "USA",
+  "Korea Republic": "South Korea",
+  "Czechia": "Czech Republic",
+  "Cape Verde": "Cape Verde Islands",
+  "Côte d'Ivoire": "Ivory Coast",
+  "IR Iran": "Iran",
+};
+
+type LiveStats = NonNullable<Match["liveStats"]>;
+
+function teamCanonical(name: string): string {
+  return canonical(AF_NAME_TO_CANONICAL[name] ?? name);
+}
+
+function getAfConfig() {
+  return {
+    key: process.env.API_FOOTBALL_KEY ?? "",
+    leagueId: process.env.API_FOOTBALL_LEAGUE_ID ?? "1",
+    season: process.env.API_FOOTBALL_SEASON ?? "2026",
+  };
+}
+
+function parseStatVal(v: string | number | null): number {
+  if (v === null) return 0;
+  if (typeof v === "number") return v;
+  return parseInt(v.replace("%", "").trim(), 10) || 0;
+}
+
+function getAfStat(
+  stats: Array<{ type: string; value: string | number | null }>,
+  type: string
+): number {
+  return parseStatVal(stats.find(s => s.type === type)?.value ?? null);
+}
+
+function parseAfStatisticsBlocks(
+  home: { statistics: Array<{ type: string; value: string | number | null }> },
+  away: { statistics: Array<{ type: string; value: string | number | null }> }
+): LiveStats {
+  return {
+    shotsOnGoal: [getAfStat(home.statistics, "Shots on Goal"), getAfStat(away.statistics, "Shots on Goal")],
+    totalShots: [getAfStat(home.statistics, "Total Shots"), getAfStat(away.statistics, "Total Shots")],
+    cornerKicks: [getAfStat(home.statistics, "Corner Kicks"), getAfStat(away.statistics, "Corner Kicks")],
+    yellowCards: [getAfStat(home.statistics, "Yellow Cards"), getAfStat(away.statistics, "Yellow Cards")],
+    redCards: [getAfStat(home.statistics, "Red Cards"), getAfStat(away.statistics, "Red Cards")],
+    possession: [getAfStat(home.statistics, "Ball Possession"), getAfStat(away.statistics, "Ball Possession")],
+    fouls: [getAfStat(home.statistics, "Fouls"), getAfStat(away.statistics, "Fouls")],
+  };
+}
+
+function pickStatPair(af: [number, number], fallback?: [number, number]): [number, number] {
+  if (af[0] > 0 || af[1] > 0) return af;
+  return fallback ?? af;
+}
+
+function mergeAfLiveStats(base: LiveStats | null | undefined, af: LiveStats): LiveStats {
+  if (!base) return af;
+  return {
+    shotsOnGoal: pickStatPair(af.shotsOnGoal, base.shotsOnGoal),
+    totalShots: pickStatPair(af.totalShots, base.totalShots),
+    cornerKicks: pickStatPair(af.cornerKicks, base.cornerKicks),
+    yellowCards: pickStatPair(af.yellowCards, base.yellowCards),
+    redCards: pickStatPair(af.redCards ?? [0, 0], base.redCards),
+    possession: (af.possession?.[0] || af.possession?.[1]) ? af.possession : base.possession,
+    fouls: pickStatPair(af.fouls ?? [0, 0], base.fouls),
+  };
+}
+
+async function fetchAfLiveFixtureMap(
+  afKey: string,
+  leagueId: string,
+  season: string
+): Promise<Map<string, { fixtureId: string; elapsed: number | null }>> {
+  const map = new Map<string, { fixtureId: string; elapsed: number | null }>();
+  try {
+    const r = await fetch(
+      `https://v3.football.api-sports.io/fixtures?league=${leagueId}&season=${season}&live=all`,
+      { headers: { "x-apisports-key": afKey }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!r.ok) return map;
+    const json = await r.json() as {
+      response?: Array<{
+        fixture: { id: number; status: { elapsed: number | null } };
+        teams: { home: { name: string }; away: { name: string } };
+      }>;
+    };
+    for (const row of json.response ?? []) {
+      const home = teamCanonical(row.teams.home.name);
+      const away = teamCanonical(row.teams.away.name);
+      map.set(`${home}|${away}`, {
+        fixtureId: String(row.fixture.id),
+        elapsed: row.fixture.status.elapsed,
+      });
+    }
+  } catch (err) {
+    logger.warn({ err }, "API-Football live fixtures fetch failed");
+  }
+  return map;
+}
+
 async function fetchSdbStatsOnly(sdbId: string): Promise<Match["liveStats"]> {
   try {
     const json = await fetchSdbJson<{ eventstats?: Array<{ strStat: string; intHome: string; intAway: string }> }>(
@@ -978,13 +1084,6 @@ async function fetchSdbStatsOnly(sdbId: string): Promise<Match["liveStats"]> {
     );
     if (!json) return null;
     const stats = json.eventstats ?? [];
-    const getVal = (statName: string): number => {
-      const s = stats.find(x => x.strStat === statName);
-      return (parseInt(s?.intHome ?? "0", 10) || 0) - (parseInt(s?.intAway ?? "0", 10) || 0);
-      // Note: TheSportsDB returns per-team values, but we need both
-      // Actually let me parse both separately
-    };
-    // Parse each separately
     const getHome = (statName: string) => {
       const s = stats.find(x => x.strStat === statName);
       return parseInt(s?.intHome ?? "0", 10) || 0;
@@ -999,6 +1098,7 @@ async function fetchSdbStatsOnly(sdbId: string): Promise<Match["liveStats"]> {
       totalShots: [getHome("Total Shots"), getAway("Total Shots")],
       cornerKicks: [getHome("Corner Kicks"), getAway("Corner Kicks")],
       yellowCards: [getHome("Yellow Cards"), getAway("Yellow Cards")],
+      redCards: [getHome("Red Cards"), getAway("Red Cards")],
     };
   } catch {
     return null;
@@ -1009,69 +1109,78 @@ async function fetchLiveStatsOnly(afId: string, afKey: string): Promise<Match["l
   try {
     const r = await fetch(
       `https://v3.football.api-sports.io/fixtures/statistics?fixture=${afId}`,
-      { headers: { "x-apisports-key": afKey }, signal: AbortSignal.timeout(5000) }
+      { headers: { "x-apisports-key": afKey }, signal: AbortSignal.timeout(6000) }
     );
     if (!r.ok) return null;
-    const json = await r.json() as { response?: Array<{ team: { id: number }; statistics: Array<{ type: string; value: string | number | null }> }> };
+    const json = await r.json() as {
+      response?: Array<{ team: { id: number }; statistics: Array<{ type: string; value: string | number | null }> }>;
+    };
     const home = json.response?.[0];
     const away = json.response?.[1];
     if (!home || !away) return null;
-
-    const getVal = (stats: Array<{ type: string; value: string | number | null }>, type: string): number => {
-      const v = stats.find(s => s.type === type)?.value ?? null;
-      if (v === null) return 0;
-      if (typeof v === "number") return v;
-      return parseInt(v.replace("%", "").trim(), 10) || 0;
-    };
-
-    return {
-      shotsOnGoal: [
-        getVal(home.statistics, "Shots on Goal"),
-        getVal(away.statistics, "Shots on Goal"),
-      ],
-      totalShots: [
-        getVal(home.statistics, "Total Shots"),
-        getVal(away.statistics, "Total Shots"),
-      ],
-      cornerKicks: [
-        getVal(home.statistics, "Corner Kicks"),
-        getVal(away.statistics, "Corner Kicks"),
-      ],
-      yellowCards: [
-        getVal(home.statistics, "Yellow Cards"),
-        getVal(away.statistics, "Yellow Cards"),
-      ],
-    };
+    return parseAfStatisticsBlocks(home, away);
   } catch {
     return null;
   }
 }
 
-async function mergeStats(
-  sdbId: string,
-  afId: string | null,
-  afKey: string
-): Promise<Match["liveStats"]> {
-  // Fetch from both sources in parallel
-  const [sdbStats, afStats] = await Promise.all([
-    fetchSdbStatsOnly(sdbId),
-    afId ? fetchLiveStatsOnly(afId, afKey) : Promise.resolve(null),
-  ]);
+async function enrichStatsWithApiFootball(
+  statsMatches: Array<{
+    theSportsDbId: string;
+    homeEn: string;
+    awayEn: string;
+    status: Match["status"];
+  }>,
+  liveStatsMap: Map<string, Match["liveStats"]>
+): Promise<boolean> {
+  const { key, leagueId, season } = getAfConfig();
+  if (!key) return false;
 
-  // If neither has data, return null
-  if (!sdbStats && !afStats) return null;
+  let enriched = false;
+  const liveFixtureMap = await fetchAfLiveFixtureMap(key, leagueId, season);
 
-  // Prefer SDB for shots-on-goal (more reliable), fallback to api-sports
-  // Prefer api-sports for corners and yellow cards (if available)
-  const sdb = sdbStats || { shotsOnGoal: [0, 0], totalShots: [0, 0], cornerKicks: [0, 0], yellowCards: [0, 0] };
-  const af = afStats || { shotsOnGoal: [0, 0], totalShots: [0, 0], cornerKicks: [0, 0], yellowCards: [0, 0] };
+  const liveAfPairs: Array<{ sdbId: string; afId: string }> = [];
+  for (const m of statsMatches.filter(x => x.status === "LIVE")) {
+    const ref = liveFixtureMap.get(sdbEventKey(m.homeEn, m.awayEn));
+    if (ref) liveAfPairs.push({ sdbId: m.theSportsDbId, afId: ref.fixtureId });
+  }
 
-  return {
-    shotsOnGoal: sdbStats ? sdb.shotsOnGoal : af.shotsOnGoal,
-    totalShots: sdbStats ? sdb.totalShots : af.totalShots,
-    cornerKicks: afStats ? af.cornerKicks : sdb.cornerKicks,
-    yellowCards: afStats ? af.yellowCards : sdb.yellowCards,
-  };
+  if (liveAfPairs.length > 0) {
+    const results = await mapPool(
+      liveAfPairs,
+      async p => ({ ...p, stats: await fetchLiveStatsOnly(p.afId, key) }),
+      6
+    );
+    for (const r of results) {
+      if (!r.stats) continue;
+      liveStatsMap.set(r.sdbId, mergeAfLiveStats(liveStatsMap.get(r.sdbId), r.stats));
+      enriched = true;
+    }
+  }
+
+  const finishedTargets = statsMatches.filter(m => m.status === "FINISHED").slice(0, 12);
+  if (finishedTargets.length > 0) {
+    const idResults = await mapPool(
+      finishedTargets,
+      async m => ({
+        sdbId: m.theSportsDbId,
+        afId: await fetchSdbApiFootballId(m.theSportsDbId),
+      }),
+      4
+    );
+    const afStatsResults = await mapPool(
+      idResults.filter(r => r.afId),
+      async r => ({ sdbId: r.sdbId, stats: await fetchLiveStatsOnly(r.afId!, key) }),
+      4
+    );
+    for (const r of afStatsResults) {
+      if (!r.stats) continue;
+      liveStatsMap.set(r.sdbId, mergeAfLiveStats(liveStatsMap.get(r.sdbId), r.stats));
+      enriched = true;
+    }
+  }
+
+  return enriched || liveFixtureMap.size > 0;
 }
 
 async function buildSdbOnlyMatches(
@@ -1313,25 +1422,16 @@ async function buildAllMatches(): Promise<{
           if (r.stats) liveStatsMap.set(r.id, r.stats);
         }
 
-        const afKey = process.env.API_FOOTBALL_KEY ?? "";
-        if (afKey) {
-          const liveWithAf = statsMatches.filter(x => x.status === "LIVE").slice(0, 6);
-          for (const m of liveWithAf) {
-            try {
-              const afId = await fetchSdbApiFootballId(m.theSportsDbId!);
-              if (!afId) continue;
-              const afStats = await fetchLiveStatsOnly(afId, afKey);
-              const existing = liveStatsMap.get(m.theSportsDbId!);
-              if (existing && afStats) {
-                liveStatsMap.set(m.theSportsDbId!, {
-                  ...existing,
-                  cornerKicks: afStats.cornerKicks,
-                  yellowCards: afStats.yellowCards,
-                });
-              }
-            } catch { /* non-fatal */ }
-          }
-        }
+        const afUsed = await enrichStatsWithApiFootball(
+          statsMatches.map(m => ({
+            theSportsDbId: m.theSportsDbId!,
+            homeEn: m.homeEn,
+            awayEn: m.awayEn,
+            status: m.status,
+          })),
+          liveStatsMap
+        );
+        if (afUsed) providers.push("api-football");
       }
     } catch (err) {
       logger.warn({ err }, "Match enrichment failed — returning base scores");
@@ -1799,12 +1899,6 @@ interface AfEvent {
   type: string;
   detail: string;
   comments: string | null;
-}
-
-function parseStatVal(v: string | number | null): number {
-  if (v === null) return 0;
-  if (typeof v === "number") return v;
-  return parseInt(v.replace("%", "").trim(), 10) || 0;
 }
 
 async function fetchApiSportsStats(fixtureId: string): Promise<{

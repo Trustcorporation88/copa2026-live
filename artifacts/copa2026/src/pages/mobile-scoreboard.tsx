@@ -499,9 +499,21 @@ function MobileMatchCard({ match, scoreChanged, isNewLive, onTap, kickoffLabel }
       </div>
 
       {match.liveStats && (isLive || isFinished) && (
-        <div style={{ marginTop: 8, display: "flex", gap: 12, fontSize: 10, color: C.pend }}>
+        <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 12, fontSize: 10, color: C.pend }}>
           <span>🎯 {match.liveStats.shotsOnGoal[0]}-{match.liveStats.shotsOnGoal[1]}</span>
-          <span>⚽ {((match.liveStats as { totalShots?: [number, number] }).totalShots ?? match.liveStats.shotsOnGoal)[0]}-{((match.liveStats as { totalShots?: [number, number] }).totalShots ?? match.liveStats.shotsOnGoal)[1]}</span>
+          <span>⚽ {(match.liveStats.totalShots ?? match.liveStats.shotsOnGoal)[0]}-{(match.liveStats.totalShots ?? match.liveStats.shotsOnGoal)[1]}</span>
+          {match.liveStats.possession && (match.liveStats.possession[0] > 0 || match.liveStats.possession[1] > 0) && (
+            <span>📊 {match.liveStats.possession[0]}-{match.liveStats.possession[1]}%</span>
+          )}
+          {(match.liveStats.cornerKicks[0] > 0 || match.liveStats.cornerKicks[1] > 0) && (
+            <span>🚩 {match.liveStats.cornerKicks[0]}-{match.liveStats.cornerKicks[1]}</span>
+          )}
+          {(match.liveStats.yellowCards[0] > 0 || match.liveStats.yellowCards[1] > 0) && (
+            <span>🟨 {match.liveStats.yellowCards[0]}-{match.liveStats.yellowCards[1]}</span>
+          )}
+          {match.liveStats.redCards && (match.liveStats.redCards[0] > 0 || match.liveStats.redCards[1] > 0) && (
+            <span>🟥 {match.liveStats.redCards[0]}-{match.liveStats.redCards[1]}</span>
+          )}
         </div>
       )}
 
