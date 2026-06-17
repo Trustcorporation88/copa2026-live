@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { format, parseISO } from "date-fns";
 import { ptBR } from "date-fns/locale";
 import { X, MapPin, Calendar, Users, BarChart2, AlertCircle, Activity } from "lucide-react";
@@ -36,10 +36,53 @@ interface StatsData {
   timeline: TimelineEvent[];
 }
 
+type ExtendedMatch = Copa2026Match & {
+  theSportsDbId?: string | null;
+  thumbnail?: string | null;
+  liveStats?: {
+    shotsOnGoal: [number, number];
+    totalShots: [number, number];
+    cornerKicks: [number, number];
+    yellowCards: [number, number];
+    redCards?: [number, number];
+    possession?: [number, number];
+    fouls?: [number, number];
+  };
+};
+
 interface MatchStatsDrawerProps {
-  match: (Copa2026Match & { theSportsDbId?: string | null; thumbnail?: string | null }) | null;
+  match: ExtendedMatch | null;
   open: boolean;
   onClose: () => void;
+}
+
+function liveStatsToStats(liveStats: NonNullable<ExtendedMatch["liveStats"]>): Stat[] {
+  const rows: Stat[] = [];
+  const add = (name: string, pair: [number, number]) => {
+    if (pair[0] > 0 || pair[1] > 0) rows.push({ name, home: pair[0], away: pair[1] });
+  };
+  add("Chutes a Gol", liveStats.shotsOnGoal);
+  add("Total de Chutes", liveStats.totalShots);
+  add("Escanteios", liveStats.cornerKicks);
+  add("Cartões Amarelos", liveStats.yellowCards);
+  if (liveStats.redCards) add("Cartões Vermelhos", liveStats.redCards);
+  if (liveStats.possession) add("Posse de Bola", liveStats.possession);
+  if (liveStats.fouls) add("Faltas", liveStats.fouls);
+  return rows;
+}
+
+function buildStatsUrl(match: ExtendedMatch): string {
+  const base = import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
+  const eventId = match.theSportsDbId ?? match.id;
+  const params = new URLSearchParams();
+  if (match.status === "FINISHED") params.set("finished", "1");
+  if (!match.theSportsDbId) {
+    params.set("home", match.homeTeam.name);
+    params.set("away", match.awayTeam.name);
+    params.set("date", match.date.slice(0, 10));
+  }
+  const qs = params.toString();
+  return `${base}/api/copa2026/match/${encodeURIComponent(eventId)}/stats${qs ? `?${qs}` : ""}`;
 }
 
 function TeamBadge({ badge, flag, name }: { badge?: string | null; flag: string; name: string }) {
@@ -98,15 +141,13 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    if (!open || !match?.theSportsDbId) {
+    if (!open || !match) {
       setStatsData(null);
       return;
     }
 
     let cancelled = false;
-    const base = import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
-    const finishedQs = match.status === "FINISHED" ? "?finished=1" : "";
-    const url = `${base}/api/copa2026/match/${match.theSportsDbId}/stats${finishedQs}`;
+    const url = buildStatsUrl(match);
 
     const load = (showSpinner: boolean) => {
       if (showSpinner) {
@@ -128,14 +169,19 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
     };
 
     load(true);
-    const pollMs = match.status === "LIVE" ? 20_000 : match.status === "FINISHED" ? 0 : 0;
+    const pollMs = match.status === "LIVE" ? 20_000 : 0;
     const timer = pollMs > 0 ? window.setInterval(() => load(false), pollMs) : undefined;
 
     return () => {
       cancelled = true;
       if (timer) window.clearInterval(timer);
     };
-  }, [open, match?.theSportsDbId, match?.status]);
+  }, [open, match?.id, match?.theSportsDbId, match?.status, match?.date, match?.homeTeam.name, match?.awayTeam.name]);
+
+  const fallbackStats = useMemo(
+    () => (match?.liveStats ? liveStatsToStats(match.liveStats) : []),
+    [match?.liveStats]
+  );
 
   if (!match) return null;
 
@@ -148,8 +194,11 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
     dateStr = format(parseISO(match.date), "dd/MM/yyyy · HH:mm", { locale: ptBR });
   } catch { /* noop */ }
 
-  const hasStats = statsData && statsData.stats.length > 0;
+  const apiStats = statsData?.stats ?? [];
+  const displayStats = apiStats.length > 0 ? apiStats : fallbackStats;
+  const hasStats = displayStats.length > 0;
   const hasLineup = statsData && (statsData.lineup.home.length > 0 || statsData.lineup.away.length > 0);
+  const usingFallbackStats = apiStats.length === 0 && fallbackStats.length > 0;
 
   return (
     <Sheet open={open} onOpenChange={v => { if (!v) onClose(); }}>
@@ -208,7 +257,6 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
             </div>
           </div>
 
-          {/* Thumbnail */}
           {match.thumbnail && (
             <div className="mt-4 rounded-lg overflow-hidden -mx-1">
               <img
@@ -251,33 +299,31 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
             </div>
           )}
 
-          {!loading && error && (
+          {!loading && error && !hasStats && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground py-4">
               <AlertCircle className="w-4 h-4" />
               <span>Estatísticas não disponíveis para esta partida.</span>
             </div>
           )}
 
-          {!loading && !error && !match.theSportsDbId && (
-            <p className="text-sm text-muted-foreground py-4">
-              Estatísticas disponíveis após o início da partida.
-            </p>
-          )}
-
-          {!loading && !error && hasStats && (
+          {!loading && hasStats && (
             <div>
-              {/* Labels */}
               <div className="flex justify-between text-xs text-muted-foreground mb-3 pb-2 border-b border-border/50">
                 <span className="font-medium">{match.homeTeam.name}</span>
                 <span className="font-medium">{match.awayTeam.name}</span>
               </div>
-              {statsData!.stats.map((stat, i) => (
+              {usingFallbackStats && (
+                <p className="text-xs text-muted-foreground mb-3">
+                  Resumo ao vivo — estatísticas completas podem demorar alguns minutos após o apito final.
+                </p>
+              )}
+              {displayStats.map((stat, i) => (
                 <StatBar key={i} stat={stat} />
               ))}
             </div>
           )}
 
-          {!loading && !error && match.theSportsDbId && !hasStats && (
+          {!loading && !error && !hasStats && (
             <p className="text-sm text-muted-foreground py-4">
               {isFinished
                 ? "Estatísticas detalhadas indisponíveis para esta partida."
@@ -286,7 +332,7 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
           )}
         </div>
 
-        {/* Timeline Section — only shown when api-sports data is available */}
+        {/* Timeline Section */}
         {!loading && statsData && statsData.timeline && statsData.timeline.length > 0 && (() => {
           const homeEvents = statsData.timeline.filter(e => e.team === "home");
           const awayEvents = statsData.timeline.filter(e => e.team === "away");
@@ -360,7 +406,6 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
 
             return (
               <div className="grid grid-cols-2 gap-x-4">
-                {/* Home */}
                 <div>
                   <p className="text-xs font-semibold text-primary mb-2 truncate">{match.homeTeam.name}</p>
                   {homeStarters.map((p, i) => <PlayerRow key={i} player={p} />)}
@@ -371,7 +416,6 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
                     </>
                   )}
                 </div>
-                {/* Away */}
                 <div>
                   <p className="text-xs font-semibold text-muted-foreground mb-2 truncate">{match.awayTeam.name}</p>
                   {awayStarters.map((p, i) => <PlayerRow key={i} player={p} />)}
