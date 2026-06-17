@@ -296,6 +296,10 @@ function mergeTopScorerLists(lists: TopScorer[][]): TopScorer[] {
 interface SdbEventDetail {
   idEvent: string;
   idAPIfootball?: string | null;
+  strHomeTeam?: string | null;
+  strAwayTeam?: string | null;
+  dateEvent?: string | null;
+  strTimestamp?: string | null;
   strProgress?: string | null;
   strHomeGoalDetails?: string | null;
   strAwayGoalDetails?: string | null;
@@ -343,6 +347,8 @@ interface StatsCache {
 }
 const statsCacheMap = new Map<string, StatsCache>();
 const STATS_TTL = 45_000;
+const STATS_EMPTY_TTL = 15_000;
+const FINISHED_STATS_TTL = 3_600_000;
 
 interface StandingsCache {
   data: GroupStanding[];
@@ -1623,9 +1629,48 @@ router.get("/copa2026/standings", async (_req, res) => {
 // ─── Top-scorer helpers ──────────────────────────────────────────────────────
 
 async function fetchSdbApiFootballId(sdbEventId: string): Promise<string | null> {
-  // Reuse the live-detail cache which already stores idAPIfootball
-  const detail = await fetchLiveEventDetail(sdbEventId);
-  return detail?.idAPIfootball ?? null;
+  const detail = await fetchLiveEventDetail(sdbEventId, FINISHED_DETAIL_TTL);
+  if (detail?.idAPIfootball) return String(detail.idAPIfootball);
+
+  const statsJson = await fetchSdbJson<{
+    eventstats?: Array<{ idApiFootball?: string; idAPIfootball?: string }>;
+  }>(`lookupeventstats.php?id=${sdbEventId}`, 8000);
+  const fromStats = statsJson?.eventstats?.[0]?.idApiFootball ?? statsJson?.eventstats?.[0]?.idAPIfootball;
+  if (fromStats) return String(fromStats);
+
+  if (!detail?.strHomeTeam || !detail?.strAwayTeam) return null;
+  const { key, leagueId, season } = getAfConfig();
+  if (!key) return null;
+
+  const date = detail.dateEvent ?? detail.strTimestamp?.slice(0, 10);
+  if (!date) return null;
+
+  try {
+    const r = await fetch(
+      `https://v3.football.api-sports.io/fixtures?league=${leagueId}&season=${season}&date=${date}`,
+      { headers: { "x-apisports-key": key }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!r.ok) return null;
+    const json = await r.json() as {
+      response?: Array<{
+        fixture: { id: number };
+        teams: { home: { name: string }; away: { name: string } };
+      }>;
+    };
+    const homeWant = teamCanonical(detail.strHomeTeam);
+    const awayWant = teamCanonical(detail.strAwayTeam);
+    for (const row of json.response ?? []) {
+      if (
+        teamCanonical(row.teams.home.name) === homeWant &&
+        teamCanonical(row.teams.away.name) === awayWant
+      ) {
+        return String(row.fixture.id);
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, sdbEventId }, "API-Football fixture search failed");
+  }
+  return null;
 }
 
 interface AfGoalEvent {
@@ -1968,19 +2013,126 @@ async function fetchApiSportsStats(fixtureId: string): Promise<{
   }
 }
 
+const AF_POS_PT: Record<string, string> = {
+  G: "GOL", D: "ZAG", M: "MC", F: "AT",
+};
+
+function mapSdbStatsRows(
+  rows: Array<{ strStat: string; intHome: string; intAway: string }>
+): Array<{ name: string; home: number; away: number }> {
+  return rows.map(s => ({
+    name: STAT_PT[s.strStat] ?? s.strStat,
+    home: parseInt(s.intHome ?? "0", 10) || 0,
+    away: parseInt(s.intAway ?? "0", 10) || 0,
+  }));
+}
+
+function mapSdbLineupRows(
+  rows: Array<{
+    strPlayer: string;
+    intSquadNumber: string;
+    strPosition: string;
+    strHome: string;
+    strSubstitute: string;
+  }>
+): { home: Array<{ name: string; number: number; position: string; isSub: boolean }>; away: Array<{ name: string; number: number; position: string; isSub: boolean }> } {
+  const mapSide = (homeSide: boolean) =>
+    rows
+      .filter(p => (homeSide ? p.strHome === "Yes" : p.strHome !== "Yes"))
+      .map(p => ({
+        name: p.strPlayer,
+        number: parseInt(p.intSquadNumber ?? "0", 10) || 0,
+        position: POSITION_PT[p.strPosition] ?? p.strPosition ?? "",
+        isSub: p.strSubstitute === "Yes",
+      }))
+      .sort((a, b) => (a.isSub ? 1 : 0) - (b.isSub ? 1 : 0));
+
+  return { home: mapSide(true), away: mapSide(false) };
+}
+
+async function fetchApiSportsLineups(fixtureId: string): Promise<{
+  home: Array<{ name: string; number: number; position: string; isSub: boolean }>;
+  away: Array<{ name: string; number: number; position: string; isSub: boolean }>;
+} | null> {
+  const key = process.env.API_FOOTBALL_KEY ?? "";
+  if (!key) return null;
+
+  try {
+    const r = await fetch(
+      `https://v3.football.api-sports.io/fixtures/lineups?fixture=${fixtureId}`,
+      { headers: { "x-apisports-key": key }, signal: AbortSignal.timeout(6000) }
+    );
+    if (!r.ok) return null;
+    const json = await r.json() as {
+      response?: Array<{
+        team: { id: number };
+        startXI: Array<{ player: { name: string; number: number; pos: string | null } }>;
+        substitutes: Array<{ player: { name: string; number: number; pos: string | null } }>;
+      }>;
+    };
+    if (!json.response?.length) return null;
+
+    const mapTeam = (block: (typeof json.response)[number] | undefined) => {
+      if (!block) return [];
+      const starters = (block.startXI ?? []).map(x => ({
+        name: x.player.name,
+        number: x.player.number ?? 0,
+        position: AF_POS_PT[x.player.pos ?? ""] ?? x.player.pos ?? "",
+        isSub: false,
+      }));
+      const subs = (block.substitutes ?? []).map(x => ({
+        name: x.player.name,
+        number: x.player.number ?? 0,
+        position: AF_POS_PT[x.player.pos ?? ""] ?? x.player.pos ?? "",
+        isSub: true,
+      }));
+      return [...starters, ...subs];
+    };
+
+    return {
+      home: mapTeam(json.response[0]),
+      away: mapTeam(json.response[1]),
+    };
+  } catch (err) {
+    logger.warn({ err, fixtureId }, "api-sports lineups fetch failed");
+    return null;
+  }
+}
+
+function statsPayloadHasContent(data: {
+  stats: unknown[];
+  lineup: { home: unknown[]; away: unknown[] };
+  timeline: unknown[];
+}): boolean {
+  return (
+    data.stats.length > 0 ||
+    data.lineup.home.length > 0 ||
+    data.lineup.away.length > 0 ||
+    data.timeline.length > 0
+  );
+}
+
 router.get("/copa2026/match/:eventId/stats", async (req, res) => {
   const { eventId } = req.params;
   const now = Date.now();
+  const finished = req.query.finished === "1" || req.query.finished === "true";
 
   const cached = statsCacheMap.get(eventId);
   if (cached && now < cached.expiresAt) {
-    res.json(cached.data);
-    return;
+    const payload = cached.data as {
+      stats: unknown[];
+      lineup: { home: unknown[]; away: unknown[] };
+      timeline: unknown[];
+    };
+    if (statsPayloadHasContent(payload)) {
+      res.json(cached.data);
+      return;
+    }
   }
 
   try {
-    const [statsJson, lineupJson] = await Promise.all([
-      fetchSdbJson<{ eventstats?: Array<{ strStat: string; intHome: string; intAway: string; idApiFootball?: string }> }>(
+    const [statsJson, lineupJson, apiFootballId] = await Promise.all([
+      fetchSdbJson<{ eventstats?: Array<{ strStat: string; intHome: string; intAway: string; idApiFootball?: string; idAPIfootball?: string }> }>(
         `lookupeventstats.php?id=${eventId}`,
         8000
       ),
@@ -1988,51 +2140,36 @@ router.get("/copa2026/match/:eventId/stats", async (req, res) => {
         strPlayer: string; intSquadNumber: string; strPosition: string;
         strHome: string; strSubstitute: string;
       }> }>(`lookuplineup.php?id=${eventId}`, 8000),
+      fetchSdbApiFootballId(eventId),
     ]);
 
-    let stats = (statsJson?.eventstats ?? []).map(s => ({
-      name: STAT_PT[s.strStat] ?? s.strStat,
-      home: parseInt(s.intHome ?? "0", 10) || 0,
-      away: parseInt(s.intAway ?? "0", 10) || 0,
-    }));
-
+    let stats = mapSdbStatsRows(statsJson?.eventstats ?? []);
     let timeline: Array<{ minute: number; type: string; team: "home" | "away"; player: string; assist?: string }> = [];
+    let lineup = mapSdbLineupRows(lineupJson?.lineup ?? []);
 
-    const apiFootballId = statsJson.eventstats?.[0]?.idApiFootball;
     if (apiFootballId) {
-      const enriched = await fetchApiSportsStats(apiFootballId);
-      if (enriched) {
+      const [enriched, afLineup] = await Promise.all([
+        fetchApiSportsStats(apiFootballId),
+        fetchApiSportsLineups(apiFootballId),
+      ]);
+      if (enriched?.stats?.length) {
         stats = enriched.stats;
         timeline = enriched.timeline;
       }
+      if (afLineup && (afLineup.home.length > 0 || afLineup.away.length > 0)) {
+        lineup = afLineup;
+      }
     }
 
-    const lineup = {
-      home: (lineupJson?.lineup ?? [])
-        .filter(p => p.strHome === "Yes")
-        .map(p => ({
-          name: p.strPlayer,
-          number: parseInt(p.intSquadNumber ?? "0", 10) || 0,
-          position: POSITION_PT[p.strPosition] ?? p.strPosition ?? "",
-          isSub: p.strSubstitute === "Yes",
-        }))
-        .sort((a, b) => (a.isSub ? 1 : 0) - (b.isSub ? 1 : 0)),
-      away: (lineupJson?.lineup ?? [])
-        .filter(p => p.strHome !== "Yes")
-        .map(p => ({
-          name: p.strPlayer,
-          number: parseInt(p.intSquadNumber ?? "0", 10) || 0,
-          position: POSITION_PT[p.strPosition] ?? p.strPosition ?? "",
-          isSub: p.strSubstitute === "Yes",
-        }))
-        .sort((a, b) => (a.isSub ? 1 : 0) - (b.isSub ? 1 : 0)),
-    };
-
     const data = { stats, lineup, timeline };
-    statsCacheMap.set(eventId, { data, expiresAt: now + STATS_TTL });
+    const hasContent = statsPayloadHasContent(data);
+    const ttl = hasContent
+      ? (finished ? FINISHED_STATS_TTL : STATS_TTL)
+      : STATS_EMPTY_TTL;
+    statsCacheMap.set(eventId, { data, expiresAt: now + ttl });
     res.json(data);
   } catch (err) {
-    logger.warn({ err }, "Stats fetch failed");
+    logger.warn({ err, eventId }, "Stats fetch failed");
     res.json({ stats: [], lineup: { home: [], away: [] }, timeline: [] });
   }
 });

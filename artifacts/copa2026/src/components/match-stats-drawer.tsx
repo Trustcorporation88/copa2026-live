@@ -105,7 +105,8 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
 
     let cancelled = false;
     const base = import.meta.env.BASE_URL?.replace(/\/$/, "") ?? "";
-    const url = `${base}/api/copa2026/match/${match.theSportsDbId}/stats`;
+    const finishedQs = match.status === "FINISHED" ? "?finished=1" : "";
+    const url = `${base}/api/copa2026/match/${match.theSportsDbId}/stats${finishedQs}`;
 
     const load = (showSpinner: boolean) => {
       if (showSpinner) {
@@ -127,7 +128,7 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
     };
 
     load(true);
-    const pollMs = match.status === "LIVE" ? 20_000 : 0;
+    const pollMs = match.status === "LIVE" ? 20_000 : match.status === "FINISHED" ? 0 : 0;
     const timer = pollMs > 0 ? window.setInterval(() => load(false), pollMs) : undefined;
 
     return () => {
@@ -276,9 +277,11 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
             </div>
           )}
 
-          {!loading && !error && match.theSportsDbId && !hasStats && !loading && (
+          {!loading && !error && match.theSportsDbId && !hasStats && (
             <p className="text-sm text-muted-foreground py-4">
-              Estatísticas serão exibidas após o início da partida.
+              {isFinished
+                ? "Estatísticas detalhadas indisponíveis para esta partida."
+                : "Estatísticas serão exibidas após o início da partida."}
             </p>
           )}
         </div>
@@ -385,7 +388,9 @@ export function MatchStatsDrawer({ match, open, onClose }: MatchStatsDrawerProps
 
           {!loading && !hasLineup && !error && (
             <p className="text-sm text-muted-foreground py-2">
-              Escalação será divulgada antes do jogo.
+              {isFinished
+                ? "Escalação indisponível para esta partida."
+                : "Escalação será divulgada antes do jogo."}
             </p>
           )}
         </div>
