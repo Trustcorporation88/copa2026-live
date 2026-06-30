@@ -19,6 +19,20 @@ function sdbEventKey(home: string, away: string): string {
   return `${canonical(home)}|${canonical(away)}`;
 }
 
+function formatMatchGroup(fdm: FdMatch): string {
+  if (fdm.stage && fdm.stage !== "GROUP_STAGE") {
+    return "Mata-mata";
+  }
+  return (fdm.group ?? "").replace("GROUP_", "");
+}
+
+function formatMatchRound(fdm: FdMatch): string {
+  if (fdm.stage && fdm.stage !== "GROUP_STAGE") {
+    return STAGE_PT[fdm.stage] ?? fdm.stage;
+  }
+  return `Rodada ${fdm.matchday ?? 1}`;
+}
+
 const PT_NAME: Record<string, string> = {
   "Algeria": "Argélia", "Argentina": "Argentina", "Australia": "Austrália",
   "Austria": "Áustria", "Belgium": "Bélgica", "Bosnia-Herzegovina": "Bósnia-Herzegovina",
@@ -189,7 +203,20 @@ function parseGoalScorers(details: string | null | undefined): string[] {
 }
 
 function parsePlayerNameFromGoalDetail(detail: string): string {
-  return detail.trim().replace(/\s+\d+(?:\+\d+)?['′]?\s*$/, "");
+  return detail
+    .trim()
+    .replace(/\s+\d+(?:['′]\+\d+|\+(?:\d+))?['′]?\s*$/u, "")
+    .trim();
+}
+
+function normalizeScorerKey(name: string): string {
+  const base = parsePlayerNameFromGoalDetail(name);
+  return base
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 interface SdbTimelineEntry {
@@ -243,30 +270,32 @@ function goalScorersFromTimeline(timeline: SdbTimelineEntry[]): { home: string[]
 }
 
 function buildTopScorersFromMatches(matches: Match[]): TopScorer[] {
-  const playerMap = new Map<string, { team: string; teamFlag: string; goals: number }>();
+  const playerMap = new Map<string, { player: string; team: string; teamFlag: string; goals: number }>();
 
   for (const m of matches) {
     if (!m.goalScorers) continue;
     for (const detail of m.goalScorers.home) {
       const name = parsePlayerNameFromGoalDetail(detail);
       if (!name) continue;
-      const existing = playerMap.get(name);
+      const key = normalizeScorerKey(name);
+      const existing = playerMap.get(key);
       if (existing) existing.goals++;
-      else playerMap.set(name, { team: m.homeTeam.name, teamFlag: m.homeTeam.flag, goals: 1 });
+      else playerMap.set(key, { player: name, team: m.homeTeam.name, teamFlag: m.homeTeam.flag, goals: 1 });
     }
     for (const detail of m.goalScorers.away) {
       const name = parsePlayerNameFromGoalDetail(detail);
       if (!name) continue;
-      const existing = playerMap.get(name);
+      const key = normalizeScorerKey(name);
+      const existing = playerMap.get(key);
       if (existing) existing.goals++;
-      else playerMap.set(name, { team: m.awayTeam.name, teamFlag: m.awayTeam.flag, goals: 1 });
+      else playerMap.set(key, { player: name, team: m.awayTeam.name, teamFlag: m.awayTeam.flag, goals: 1 });
     }
   }
 
-  return [...playerMap.entries()]
-    .map(([player, info]) => ({
+  return [...playerMap.values()]
+    .map((info) => ({
       rank: 0,
-      player,
+      player: info.player,
       photo: null,
       team: info.team,
       teamFlag: info.teamFlag,
@@ -282,16 +311,19 @@ function mergeTopScorerLists(lists: TopScorer[][]): TopScorer[] {
   const map = new Map<string, TopScorer>();
   for (const list of lists) {
     for (const s of list) {
-      const existing = map.get(s.player);
+      const key = normalizeScorerKey(s.player);
+      const displayName = parsePlayerNameFromGoalDetail(s.player);
+      const existing = map.get(key);
       if (!existing) {
-        map.set(s.player, { ...s });
+        map.set(key, { ...s, player: displayName });
         continue;
       }
       const goals = Math.max(existing.goals, s.goals);
       const assists = Math.max(existing.assists, s.assists);
       const prefer = s.goals > existing.goals ? s : existing;
-      map.set(s.player, {
+      map.set(key, {
         ...prefer,
+        player: displayName.length >= existing.player.length ? displayName : existing.player,
         goals,
         assists,
         photo: existing.photo ?? s.photo ?? null,
@@ -349,6 +381,7 @@ interface MainCache {
 let mainCache: MainCache | null = null;
 let staleMainCache: MainCache | null = null;
 const MAIN_TTL = 30_000;
+const MAIN_TTL_LIVE = 8_000;
 const STALE_TTL = 1_800_000; // 30 min — last good payload when live fetch fails
 
 interface StatsCache {
@@ -381,7 +414,7 @@ interface BracketCache {
   expiresAt: number;
 }
 let bracketCache: BracketCache | null = null;
-const BRACKET_TTL = 300_000;
+const BRACKET_TTL = 120_000;
 
 // ─── Standings types ─────────────────────────────────────────────────────────
 
@@ -733,6 +766,138 @@ async function fetchEspnScoresSafe(dates: string[]): Promise<Map<string, EspnSco
   }
 }
 
+interface TimedEspnEvent {
+  utcDate: string;
+  homeTeam: string;
+  awayTeam: string;
+  homeScore: number | null;
+  awayScore: number | null;
+  status: "PENDING" | "LIVE" | "FINISHED";
+}
+
+const BRACKET_PLACEHOLDER_RE = /(?:group\s+[a-z]|third\s+place|winner|2nd\s+place|round\s+of\s+\d+)/i;
+
+function isDefinedBracketTeam(name: string | undefined | null): boolean {
+  if (!name || name === "TBD") return false;
+  if (BRACKET_PLACEHOLDER_RE.test(name)) return false;
+  const canon = canonical(name);
+  if (PT_NAME[canon] || PT_NAME[name] || FLAG[canon] || FLAG[name]) return true;
+  return name.length >= 3 && name.length <= 32;
+}
+
+function bracketTeamFromEnglish(enName: string): { name: string; flag: string; en: string } {
+  const en = canonical(enName);
+  return {
+    en,
+    name: PT_NAME[en] ?? PT_NAME[enName] ?? enName,
+    flag: FLAG[en] ?? FLAG[enName] ?? "🏳️",
+  };
+}
+
+function resolveBracketTeam(fdName: string, ...fallbacks: (string | undefined)[]): { name: string; flag: string; en: string } {
+  const tryName = (raw: string) => {
+    if (!isDefinedBracketTeam(raw)) return null;
+    return bracketTeamFromEnglish(raw);
+  };
+  if (fdName !== "TBD") {
+    const fromFd = tryName(fdName);
+    if (fromFd) return fromFd;
+  }
+  for (const fb of fallbacks) {
+    if (!fb) continue;
+    const resolved = tryName(fb);
+    if (resolved) return resolved;
+  }
+  return { name: "A definir", flag: "🏳️", en: "TBD" };
+}
+
+async function fetchEspnTimedEventsForDates(dates: string[]): Promise<TimedEspnEvent[]> {
+  const unique = [...new Set(dates.map(d => d.replace(/-/g, "")))];
+  if (unique.length === 0) return [];
+
+  const results = await mapPool(unique, async (yyyymmdd) => {
+    try {
+      const r = await fetchWithRetry(
+        `https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates=${yyyymmdd}`,
+        { headers: { "User-Agent": "seligaaqui.online/1.0" }, signal: AbortSignal.timeout(8000) },
+        2
+      );
+      if (!r.ok) return [] as TimedEspnEvent[];
+      const json = await r.json() as {
+        events?: Array<{
+          date?: string;
+          competitions?: Array<{
+            date?: string;
+            status?: { type?: { name?: string; state?: string } };
+            competitors?: Array<{ homeAway?: string; score?: string; team?: { displayName?: string } }>;
+          }>;
+        }>;
+      };
+      const out: TimedEspnEvent[] = [];
+      for (const ev of json.events ?? []) {
+        const comp = ev.competitions?.[0];
+        if (!comp) continue;
+        const utcDate = ev.date ?? comp.date ?? "";
+        if (!utcDate) continue;
+        const homeC = comp.competitors?.find(c => c.homeAway === "home");
+        const awayC = comp.competitors?.find(c => c.homeAway === "away");
+        const homeRaw = homeC?.team?.displayName ?? "";
+        const awayRaw = awayC?.team?.displayName ?? "";
+        if (!homeRaw || !awayRaw) continue;
+        out.push({
+          utcDate,
+          homeTeam: ESPN_TO_CANONICAL[homeRaw] ?? homeRaw,
+          awayTeam: ESPN_TO_CANONICAL[awayRaw] ?? awayRaw,
+          homeScore: parseScore(homeC?.score),
+          awayScore: parseScore(awayC?.score),
+          status: espnStatusToMatch(comp.status?.type?.name ?? "", comp.status?.type?.state),
+        });
+      }
+      return out;
+    } catch (err) {
+      logger.warn({ err, yyyymmdd }, "ESPN timed events fetch failed");
+      return [];
+    }
+  }, 4);
+
+  return results.flat().sort((a, b) => new Date(a.utcDate).getTime() - new Date(b.utcDate).getTime());
+}
+
+function matchTimedEventByDate(
+  fdUtc: string,
+  events: TimedEspnEvent[],
+  used: Set<number>
+): TimedEspnEvent | null {
+  const fdMs = new Date(fdUtc).getTime();
+  if (!Number.isFinite(fdMs)) return null;
+
+  for (let i = 0; i < events.length; i++) {
+    if (used.has(i)) continue;
+    if (new Date(events[i].utcDate).getTime() === fdMs) {
+      used.add(i);
+      return events[i];
+    }
+  }
+
+  let bestIdx = -1;
+  let bestDelta = Infinity;
+  for (let i = 0; i < events.length; i++) {
+    if (used.has(i)) continue;
+    const evMs = new Date(events[i].utcDate).getTime();
+    if (!Number.isFinite(evMs)) continue;
+    const delta = Math.abs(evMs - fdMs);
+    if (delta <= 90 * 60 * 1000 && delta < bestDelta) {
+      bestDelta = delta;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx >= 0) {
+    used.add(bestIdx);
+    return events[bestIdx];
+  }
+  return null;
+}
+
 async function mapPool<T, R>(
   items: T[],
   fn: (item: T) => Promise<R>,
@@ -754,8 +919,10 @@ async function mapPool<T, R>(
 function persistMainCache(matches: Match[], source: "live" | "cache" | "static"): void {
   if (matches.length === 0) return;
   const now = Date.now();
+  const hasLive = matches.some(m => m.status === "LIVE");
+  const ttl = hasLive ? MAIN_TTL_LIVE : MAIN_TTL;
   const data = { matches, updatedAt: new Date().toISOString(), source };
-  mainCache = { data, expiresAt: now + MAIN_TTL };
+  mainCache = { data, expiresAt: now + ttl };
   staleMainCache = { data, expiresAt: now + STALE_TTL };
 }
 
@@ -768,6 +935,58 @@ function getStaleScoresResponse(): { matches: Match[]; updatedAt: string; source
     return { ...mainCache.data, source: "cache" };
   }
   return null;
+}
+
+function resolveMatchMetaFromCache(eventId: string): {
+  homePt: string;
+  awayPt: string;
+  homeEn: string;
+  awayEn: string;
+  date: string;
+} | null {
+  const matches =
+    (mainCache && mainCache.data.matches.length > 0 ? mainCache.data.matches : null) ??
+    getStaleScoresResponse()?.matches ??
+    [];
+  const m = matches.find((row) => row.id === eventId);
+  if (!m) return null;
+  const homePt = m.homeTeam.name;
+  const awayPt = m.awayTeam.name;
+  return {
+    homePt,
+    awayPt,
+    homeEn: ptToEn(homePt) || homePt,
+    awayEn: ptToEn(awayPt) || awayPt,
+    date: m.date.slice(0, 10),
+  };
+}
+
+async function resolveMatchMeta(eventId: string): Promise<{
+  homePt: string;
+  awayPt: string;
+  homeEn: string;
+  awayEn: string;
+  date: string;
+} | null> {
+  const cached = resolveMatchMetaFromCache(eventId);
+  if (cached) return cached;
+
+  const fdMatch = /^fd-(\d+)$/i.exec(eventId);
+  if (!fdMatch) return null;
+
+  const fixtures = await fetchFdFixturesSafe();
+  const fdm = fixtures?.find((row) => String(row.id) === fdMatch[1]);
+  if (!fdm) return null;
+
+  const homeEn = fdm.homeTeam.name ?? "";
+  const awayEn = fdm.awayTeam.name ?? "";
+  return {
+    homePt: PT_NAME[homeEn] ?? homeEn,
+    awayPt: PT_NAME[awayEn] ?? awayEn,
+    homeEn,
+    awayEn,
+    date: (fdm.utcDate ?? "").slice(0, 10),
+  };
 }
 
 async function fetchFdFixtures(allStages = false): Promise<FdMatch[]> {
@@ -921,6 +1140,59 @@ function parseScore(val: string | number | null | undefined): number | null {
   return Number.isNaN(n) ? null : n;
 }
 
+/** Escolhe o placar mais atual entre fontes (ao vivo: maior total de gols). */
+function pickBestScore(
+  candidates: Array<{ home: number; away: number }>,
+  isLive: boolean
+): { home: number; away: number } | null {
+  if (candidates.length === 0) return null;
+  if (isLive) {
+    return candidates.reduce((best, c) =>
+      c.home + c.away >= best.home + best.away ? c : best
+    );
+  }
+  return candidates[0];
+}
+
+/** Garante que o placar não fique atrás da lista de gols (fontes desincronizadas). */
+function reconcileScoreWithGoals(
+  homeScore: number | null,
+  awayScore: number | null,
+  goalScorers: { home: string[]; away: string[] } | null
+): { home: number | null; away: number | null } {
+  if (!goalScorers) return { home: homeScore, away: awayScore };
+  let home = homeScore;
+  let away = awayScore;
+  const gh = goalScorers.home.length;
+  const ga = goalScorers.away.length;
+  if (home !== null && gh > home) home = gh;
+  if (away !== null && ga > away) away = ga;
+  if (home === null && gh > 0) home = gh;
+  if (away === null && ga > 0) away = ga;
+  return { home, away };
+}
+
+function resolveMatchScores(
+  sdbHs: number | null,
+  sdbAs: number | null,
+  fdHs: number | null,
+  fdAs: number | null,
+  espnHs: number | null,
+  espnAs: number | null,
+  afHs: number | null,
+  afAs: number | null,
+  isLive: boolean
+): { home: number | null; away: number | null } {
+  const candidates: Array<{ home: number; away: number }> = [];
+  // ESPN e API-Football tendem a atualizar mais rápido ao vivo.
+  if (espnHs !== null && espnAs !== null) candidates.push({ home: espnHs, away: espnAs });
+  if (afHs !== null && afAs !== null) candidates.push({ home: afHs, away: afAs });
+  if (sdbHs !== null && sdbAs !== null) candidates.push({ home: sdbHs, away: sdbAs });
+  if (fdHs !== null && fdAs !== null) candidates.push({ home: fdHs, away: fdAs });
+  const picked = pickBestScore(candidates, isLive);
+  return picked ?? { home: null, away: null };
+}
+
 function toStatus(
   fdStatus: string,
   utcDate: string,
@@ -1018,6 +1290,96 @@ function getAfConfig() {
   };
 }
 
+interface AfTimedFixture {
+  utcDate: string;
+  home: string;
+  away: string;
+  homeScore: number | null;
+  awayScore: number | null;
+  status: "PENDING" | "LIVE" | "FINISHED";
+}
+
+function afShortStatusToMatch(short: string): "PENDING" | "LIVE" | "FINISHED" {
+  const s = short.toUpperCase();
+  if (["FT", "AET", "PEN"].includes(s)) return "FINISHED";
+  if (["1H", "2H", "HT", "ET", "BT", "P", "LIVE"].includes(s)) return "LIVE";
+  return "PENDING";
+}
+
+async function fetchAfKnockoutFixtures(from: string, to: string): Promise<AfTimedFixture[]> {
+  const { key, leagueId, season } = getAfConfig();
+  if (!key || !from || !to) return [];
+  try {
+    const r = await fetchWithRetry(
+      `https://v3.football.api-sports.io/fixtures?league=${leagueId}&season=${season}&from=${from}&to=${to}`,
+      { headers: { "x-apisports-key": key }, signal: AbortSignal.timeout(10_000) },
+      2
+    );
+    if (!r.ok) return [];
+    const json = await r.json() as {
+      response?: Array<{
+        fixture: { date: string; status: { short: string } };
+        teams: { home: { name: string }; away: { name: string } };
+        goals: { home: number | null; away: number | null };
+        league: { round?: string };
+      }>;
+    };
+    return (json.response ?? [])
+      .filter(row => {
+        const round = (row.league.round ?? "").toLowerCase();
+        return round.includes("32") || round.includes("16") || round.includes("quarter")
+          || round.includes("semi") || round.includes("final") || round.includes("knockout")
+          || round.includes("round of") || round.includes("3rd");
+      })
+      .map(row => ({
+        utcDate: row.fixture.date,
+        home: teamCanonical(row.teams.home.name),
+        away: teamCanonical(row.teams.away.name),
+        homeScore: row.goals.home,
+        awayScore: row.goals.away,
+        status: afShortStatusToMatch(row.fixture.status.short),
+      }));
+  } catch (err) {
+    logger.warn({ err, from, to }, "API-Football knockout fixtures fetch failed");
+    return [];
+  }
+}
+
+function matchAfFixtureByDate(
+  fdUtc: string,
+  fixtures: AfTimedFixture[],
+  used: Set<number>
+): AfTimedFixture | null {
+  const fdMs = new Date(fdUtc).getTime();
+  if (!Number.isFinite(fdMs)) return null;
+
+  for (let i = 0; i < fixtures.length; i++) {
+    if (used.has(i)) continue;
+    if (new Date(fixtures[i].utcDate).getTime() === fdMs) {
+      used.add(i);
+      return fixtures[i];
+    }
+  }
+
+  let bestIdx = -1;
+  let bestDelta = Infinity;
+  for (let i = 0; i < fixtures.length; i++) {
+    if (used.has(i)) continue;
+    const evMs = new Date(fixtures[i].utcDate).getTime();
+    if (!Number.isFinite(evMs)) continue;
+    const delta = Math.abs(evMs - fdMs);
+    if (delta <= 90 * 60 * 1000 && delta < bestDelta) {
+      bestDelta = delta;
+      bestIdx = i;
+    }
+  }
+  if (bestIdx >= 0) {
+    used.add(bestIdx);
+    return fixtures[bestIdx];
+  }
+  return null;
+}
+
 function parseStatVal(v: string | number | null): number {
   if (v === null) return 0;
   if (typeof v === "number") return v;
@@ -1068,8 +1430,8 @@ async function fetchAfLiveFixtureMap(
   afKey: string,
   leagueId: string,
   season: string
-): Promise<Map<string, { fixtureId: string; elapsed: number | null }>> {
-  const map = new Map<string, { fixtureId: string; elapsed: number | null }>();
+): Promise<Map<string, { fixtureId: string; elapsed: number | null; homeGoals: number | null; awayGoals: number | null }>> {
+  const map = new Map<string, { fixtureId: string; elapsed: number | null; homeGoals: number | null; awayGoals: number | null }>();
   try {
     const r = await fetch(
       `https://v3.football.api-sports.io/fixtures?league=${leagueId}&season=${season}&live=all`,
@@ -1079,6 +1441,7 @@ async function fetchAfLiveFixtureMap(
     const json = await r.json() as {
       response?: Array<{
         fixture: { id: number; status: { elapsed: number | null } };
+        goals: { home: number | null; away: number | null };
         teams: { home: { name: string }; away: { name: string } };
       }>;
     };
@@ -1088,6 +1451,8 @@ async function fetchAfLiveFixtureMap(
       map.set(`${home}|${away}`, {
         fixtureId: String(row.fixture.id),
         elapsed: row.fixture.status.elapsed,
+        homeGoals: row.goals.home,
+        awayGoals: row.goals.away,
       });
     }
   } catch (err) {
@@ -1146,9 +1511,11 @@ async function fetchLiveStatsOnly(afId: string, afKey: string): Promise<Match["l
 
 async function enrichStatsWithApiFootball(
   statsMatches: Array<{
-    theSportsDbId: string;
+    statsKey: string;
+    theSportsDbId: string | null;
     homeEn: string;
     awayEn: string;
+    dateIso: string;
     status: Match["status"];
   }>,
   liveStatsMap: Map<string, Match["liveStats"]>
@@ -1159,10 +1526,10 @@ async function enrichStatsWithApiFootball(
   let enriched = false;
   const liveFixtureMap = await fetchAfLiveFixtureMap(key, leagueId, season);
 
-  const liveAfPairs: Array<{ sdbId: string; afId: string }> = [];
+  const liveAfPairs: Array<{ statsKey: string; afId: string }> = [];
   for (const m of statsMatches.filter(x => x.status === "LIVE")) {
     const ref = liveFixtureMap.get(sdbEventKey(m.homeEn, m.awayEn));
-    if (ref) liveAfPairs.push({ sdbId: m.theSportsDbId, afId: ref.fixtureId });
+    if (ref) liveAfPairs.push({ statsKey: m.statsKey, afId: ref.fixtureId });
   }
 
   if (liveAfPairs.length > 0) {
@@ -1173,7 +1540,7 @@ async function enrichStatsWithApiFootball(
     );
     for (const r of results) {
       if (!r.stats) continue;
-      liveStatsMap.set(r.sdbId, mergeAfLiveStats(liveStatsMap.get(r.sdbId), r.stats));
+      liveStatsMap.set(r.statsKey, mergeAfLiveStats(liveStatsMap.get(r.statsKey), r.stats));
       enriched = true;
     }
   }
@@ -1183,19 +1550,21 @@ async function enrichStatsWithApiFootball(
     const idResults = await mapPool(
       finishedTargets,
       async m => ({
-        sdbId: m.theSportsDbId,
-        afId: await fetchSdbApiFootballId(m.theSportsDbId),
+        statsKey: m.statsKey,
+        afId: m.theSportsDbId
+          ? await fetchSdbApiFootballId(m.theSportsDbId)
+          : await fetchApiFootballIdByTeamsDate(m.homeEn, m.awayEn, m.dateIso.slice(0, 10)),
       }),
       4
     );
     const afStatsResults = await mapPool(
       idResults.filter(r => r.afId),
-      async r => ({ sdbId: r.sdbId, stats: await fetchLiveStatsOnly(r.afId!, key) }),
+      async r => ({ statsKey: r.statsKey, stats: await fetchLiveStatsOnly(r.afId!, key) }),
       4
     );
     for (const r of afStatsResults) {
       if (!r.stats) continue;
-      liveStatsMap.set(r.sdbId, mergeAfLiveStats(liveStatsMap.get(r.sdbId), r.stats));
+      liveStatsMap.set(r.statsKey, mergeAfLiveStats(liveStatsMap.get(r.statsKey), r.stats));
       enriched = true;
     }
   }
@@ -1315,14 +1684,14 @@ async function buildAllMatches(): Promise<{
   const stale = getStaleScoresResponse();
   try {
     const [fdMatches, sdbMap] = await Promise.all([
-      fetchFdFixturesSafe(),
+      fetchFdFixturesSafe(true),
       fetchSdbScoresSafe(),
     ]);
 
     const espnDates = (() => {
       const today = new Date();
       const out: string[] = [];
-      for (let i = -10; i <= 3; i++) {
+      for (let i = -14; i <= 7; i++) {
         const d = new Date(today);
         d.setDate(d.getDate() + i);
         out.push(d.toISOString().slice(0, 10));
@@ -1333,7 +1702,7 @@ async function buildAllMatches(): Promise<{
           if (d) out.push(d);
         }
       }
-      return out;
+      return [...new Set(out)];
     })();
     const espnMap = await fetchEspnScoresSafe(espnDates);
     const providers: string[] = [];
@@ -1350,30 +1719,52 @@ async function buildAllMatches(): Promise<{
 
     await enrichSdbMapSafe(sdbMap, fdMatches);
 
+    const { key: afKey, leagueId: afLeagueId, season: afSeason } = getAfConfig();
+    const afLiveMap = afKey
+      ? await fetchAfLiveFixtureMap(afKey, afLeagueId, afSeason)
+      : new Map<string, { fixtureId: string; elapsed: number | null; homeGoals: number | null; awayGoals: number | null }>();
+
     const initialMatches = fdMatches.map((fdm, idx) => {
       const homeEn = fdm.homeTeam.name ?? "";
       const awayEn = fdm.awayTeam.name ?? "";
       const key = sdbEventKey(homeEn, awayEn);
       const sdbEv = sdbMap.get(key);
       const espnEv = espnMap.get(key);
+      const afLive = afLiveMap.get(key);
 
       const sdbHs = parseScore(sdbEv?.intHomeScore);
       const sdbAs = parseScore(sdbEv?.intAwayScore);
       const fdHs = fdm.score?.fullTime?.home ?? null;
       const fdAs = fdm.score?.fullTime?.away ?? null;
-      const rawHs = sdbHs ?? fdHs ?? espnEv?.homeScore ?? null;
-      const rawAs = sdbAs ?? fdAs ?? espnEv?.awayScore ?? null;
-      const hasScore = rawHs !== null && rawAs !== null;
-      let status = toStatus(fdm.status ?? "", fdm.utcDate ?? "", sdbEv?.strStatus, hasScore);
-      if (espnEv && (status === "PENDING" || !hasScore)) {
+
+      let status = toStatus(fdm.status ?? "", fdm.utcDate ?? "", sdbEv?.strStatus, fdHs !== null && fdAs !== null);
+      if (espnEv?.status === "LIVE") status = "LIVE";
+      else if (espnEv?.status === "FINISHED") status = "FINISHED";
+      else if (espnEv && (status === "PENDING" || (fdHs === null && fdAs === null))) {
         if (espnEv.status === "LIVE" || espnEv.status === "FINISHED") status = espnEv.status;
       }
+
+      const isLive = status === "LIVE";
+      const resolved = resolveMatchScores(
+        sdbHs,
+        sdbAs,
+        fdHs,
+        fdAs,
+        espnEv?.homeScore ?? null,
+        espnEv?.awayScore ?? null,
+        afLive?.homeGoals ?? null,
+        afLive?.awayGoals ?? null,
+        isLive
+      );
+      const rawHs = resolved.home;
+      const rawAs = resolved.away;
 
       return {
         idx,
         fdm,
         sdbEv,
         espnEv,
+        afLive,
         homeEn,
         awayEn,
         rawHs,
@@ -1389,7 +1780,16 @@ async function buildAllMatches(): Promise<{
     }
 
     const liveMatches = initialMatches.filter(m => m.status === "LIVE" && m.theSportsDbId);
-    const statsMatches = initialMatches.filter(m => (m.status === "LIVE" || m.status === "FINISHED") && m.theSportsDbId);
+    const statsTargets = initialMatches
+      .filter(m => m.status === "LIVE" || m.status === "FINISHED")
+      .map(m => ({
+        statsKey: m.theSportsDbId ?? `fd-${m.fdm.id}`,
+        theSportsDbId: m.theSportsDbId,
+        homeEn: m.homeEn,
+        awayEn: m.awayEn,
+        dateIso: m.fdm.utcDate ?? "",
+        status: m.status,
+      }));
     // Finished/live matches without goal scorer strings in the bulk season feed —
     // enrich via lookupevent (minute/progress) and lookuptimeline (goals).
     const matchesNeedingGoalEnrichment = initialMatches.filter(m =>
@@ -1432,32 +1832,27 @@ async function buildAllMatches(): Promise<{
         if (goals.home.length > 0 || goals.away.length > 0) timelineGoalsMap.set(id, goals);
       }
 
-      if (statsMatches.length > 0) {
-        const sdbStatsResults = await mapPool(
-          statsMatches,
-          async m => ({ id: m.theSportsDbId!, stats: await fetchSdbStatsOnly(m.theSportsDbId!) }),
-          6
-        );
-        for (const r of sdbStatsResults) {
-          if (r.stats) liveStatsMap.set(r.id, r.stats);
+      if (statsTargets.length > 0) {
+        const sdbStatsTargets = statsTargets.filter(t => t.theSportsDbId);
+        if (sdbStatsTargets.length > 0) {
+          const sdbStatsResults = await mapPool(
+            sdbStatsTargets,
+            async m => ({ key: m.statsKey, stats: await fetchSdbStatsOnly(m.theSportsDbId!) }),
+            6
+          );
+          for (const r of sdbStatsResults) {
+            if (r.stats) liveStatsMap.set(r.key, r.stats);
+          }
         }
 
-        const afUsed = await enrichStatsWithApiFootball(
-          statsMatches.map(m => ({
-            theSportsDbId: m.theSportsDbId!,
-            homeEn: m.homeEn,
-            awayEn: m.awayEn,
-            status: m.status,
-          })),
-          liveStatsMap
-        );
+        const afUsed = await enrichStatsWithApiFootball(statsTargets, liveStatsMap);
         if (afUsed) providers.push("api-football");
       }
     } catch (err) {
       logger.warn({ err }, "Match enrichment failed — returning base scores");
     }
 
-    const matches: Match[] = initialMatches.map(({ idx, sdbEv, espnEv, homeEn, awayEn, rawHs, rawAs, status, theSportsDbId, fdm }) => {
+    const matches: Match[] = initialMatches.map(({ idx, sdbEv, espnEv, afLive, homeEn, awayEn, rawHs, rawAs, status, theSportsDbId, fdm }) => {
       const detail = theSportsDbId ? (liveDetails.get(theSportsDbId) ?? null) : null;
       const goalHomeDetails = detail?.strHomeGoalDetails ?? sdbEv?.strHomeGoalDetails;
       const goalAwayDetails = detail?.strAwayGoalDetails ?? sdbEv?.strAwayGoalDetails;
@@ -1472,28 +1867,45 @@ async function buildAllMatches(): Promise<{
       homeGoals = merged.home;
       awayGoals = merged.away;
       const hasGoalData = homeGoals.length > 0 || awayGoals.length > 0;
+      const statsKey = theSportsDbId ?? `fd-${fdm.id}`;
+
+      const goalScorersPayload = hasGoalData ? { home: homeGoals, away: awayGoals } : null;
+      const reconciled = reconcileScoreWithGoals(
+        rawHs !== null && !isNaN(rawHs) ? rawHs : null,
+        rawAs !== null && !isNaN(rawAs) ? rawAs : null,
+        goalScorersPayload
+      );
+
+      const liveMinute =
+        status === "LIVE"
+          ? (espnEv?.minute ?? (afLive?.elapsed != null ? `${afLive.elapsed}'` : null) ?? extractMinute(sdbEv, detail))
+          : null;
 
       return {
         id: `fd-${fdm.id}`,
         matchNumber: idx + 1,
-        group: (fdm.group ?? "").replace("GROUP_", ""),
-        round: `Rodada ${fdm.matchday ?? 1}`,
+        group: formatMatchGroup(fdm),
+        round: formatMatchRound(fdm),
         date: fdm.utcDate ?? "",
         venue: fdm.venue || sdbEv?.strVenue || "",
         homeTeam: { name: PT_NAME[homeEn] ?? homeEn, flag: FLAG[homeEn] ?? "🏳️", badge: sdbEv?.strHomeTeamBadge ?? null },
         awayTeam: { name: PT_NAME[awayEn] ?? awayEn, flag: FLAG[awayEn] ?? "🏳️", badge: sdbEv?.strAwayTeamBadge ?? null },
-        homeScore: rawHs !== null && !isNaN(rawHs) ? rawHs : null,
-        awayScore: rawAs !== null && !isNaN(rawAs) ? rawAs : null,
+        homeScore: reconciled.home,
+        awayScore: reconciled.away,
         status,
         theSportsDbId,
         thumbnail: sdbEv?.strThumb ?? null,
-        minute: status === "LIVE" ? (espnEv?.minute ?? extractMinute(sdbEv, detail)) : null,
-        goalScorers: hasGoalData ? { home: homeGoals, away: awayGoals } : null,
+        minute: liveMinute,
+        goalScorers: goalScorersPayload,
         liveStats: (status === "LIVE" || status === "FINISHED")
-          ? (liveStatsMap.get(theSportsDbId ?? "") ?? espnEv?.liveStats ?? null)
+          ? (liveStatsMap.get(statsKey) ?? espnEv?.liveStats ?? null)
           : null,
       };
     });
+
+    matches.sort(
+      (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
+    );
 
     return { matches, source: "live", providers };
   } catch (err) {
@@ -1591,8 +2003,13 @@ function computeStandings(matches: Match[]): GroupStanding[] {
 
 router.get("/copa2026/scores", async (_req, res) => {
   const now = Date.now();
-  if (mainCache && now < mainCache.expiresAt && mainCache.data.matches.length > 0) {
-    res.json({ ...mainCache.data, source: "cache" });
+  const cacheValid = mainCache && now < mainCache.expiresAt && mainCache.data.matches.length > 0;
+  if (cacheValid) {
+    res.json({
+      ...mainCache!.data,
+      updatedAt: new Date().toISOString(),
+      source: "live",
+    });
     return;
   }
   const { matches, source, providers } = await buildAllMatches();
@@ -1764,31 +2181,32 @@ async function buildTopScorersFromSdbTimelines(matches: Match[]): Promise<TopSco
     6
   );
 
-  const playerMap = new Map<string, { team: string; teamFlag: string; goals: number; assists: number; photo: string | null }>();
+  const playerMap = new Map<string, { player: string; team: string; teamFlag: string; goals: number; assists: number; photo: string | null }>();
   for (const { timeline } of timelines) {
     for (const e of timeline) {
       if (e.strTimeline !== "Goal" || e.strTimelineDetail === "Own Goal") continue;
-      const name = e.strPlayer?.trim();
+      const name = parsePlayerNameFromGoalDetail(e.strPlayer?.trim() ?? "");
       if (!name) continue;
+      const key = normalizeScorerKey(name);
       const team = afTeamPt(e.strTeam);
       const flag = afTeamFlag(e.strTeam);
       const photo = e.strCutout?.trim() || null;
       const assist = e.strAssist?.trim() && e.strAssist !== "0" ? e.strAssist.trim() : null;
-      const existing = playerMap.get(name);
+      const existing = playerMap.get(key);
       if (existing) {
         existing.goals++;
         if (assist) existing.assists++;
         if (!existing.photo && photo) existing.photo = photo;
       } else {
-        playerMap.set(name, { team, teamFlag: flag, goals: 1, assists: assist ? 1 : 0, photo });
+        playerMap.set(key, { player: name, team, teamFlag: flag, goals: 1, assists: assist ? 1 : 0, photo });
       }
     }
   }
 
-  return [...playerMap.entries()]
-    .map(([player, info]) => ({
+  return [...playerMap.values()]
+    .map((info) => ({
       rank: 0,
-      player,
+      player: info.player,
       photo: info.photo,
       team: info.team,
       teamFlag: info.teamFlag,
@@ -1854,27 +2272,28 @@ router.get("/copa2026/topscorers", async (_req, res) => {
     );
 
     // Step 3: aggregate goals per player
-    const playerMap = new Map<string, { team: string; teamFlag: string; goals: number }>();
+    const playerMap = new Map<string, { player: string; team: string; teamFlag: string; goals: number }>();
 
     for (const { goals } of goalResults) {
       for (const g of goals) {
-        const name = g.player.name;
+        const name = parsePlayerNameFromGoalDetail(g.player.name ?? "");
         if (!name) continue;
+        const key = normalizeScorerKey(name);
         const team = afTeamPt(g.team.name);
         const flag = afTeamFlag(g.team.name);
-        const existing = playerMap.get(name);
+        const existing = playerMap.get(key);
         if (existing) {
           existing.goals++;
         } else {
-          playerMap.set(name, { team, teamFlag: flag, goals: 1 });
+          playerMap.set(key, { player: name, team, teamFlag: flag, goals: 1 });
         }
       }
     }
 
-    const scorers: TopScorer[] = [...playerMap.entries()]
-      .map(([player, info]) => ({
+    const scorers: TopScorer[] = [...playerMap.values()]
+      .map((info) => ({
         rank: 0,
-        player,
+        player: info.player,
         photo: null,
         team: info.team,
         teamFlag: info.teamFlag,
@@ -1934,24 +2353,80 @@ router.get("/copa2026/bracket", async (_req, res) => {
       res.json([]);
       return;
     }
-    const knockout = allMatches
-      .filter(m => m.stage !== "GROUP_STAGE" && m.stage !== "PLAYOFF_ROUND_ONE" && m.stage !== "PRELIMINARY_ROUND")
+    const knockoutFd = allMatches.filter(
+      m => m.stage !== "GROUP_STAGE" && m.stage !== "PLAYOFF_ROUND_ONE" && m.stage !== "PRELIMINARY_ROUND"
+    );
+    const knockoutDates = [...new Set(
+      knockoutFd.map(m => (m.utcDate ?? "").slice(0, 10)).filter(Boolean)
+    )].sort();
+    const dateFrom = knockoutDates[0] ?? "2026-06-28";
+    const dateTo = knockoutDates[knockoutDates.length - 1] ?? "2026-07-19";
+
+    const [espnEvents, afEvents, sdbMap] = await Promise.all([
+      fetchEspnTimedEventsForDates(knockoutDates),
+      fetchAfKnockoutFixtures(dateFrom, dateTo),
+      fetchSdbScoresSafe().then(async (map) => {
+        await supplementSdbMap(map, knockoutFd);
+        return map;
+      }),
+    ]);
+
+    const usedEspn = new Set<number>();
+    const usedAf = new Set<number>();
+
+    const knockout = knockoutFd
       .map(m => {
-        const homeEn = m.homeTeam?.name ?? "TBD";
-        const awayEn = m.awayTeam?.name ?? "TBD";
+        const fdUtc = m.utcDate ?? "";
+        const espnEv = matchTimedEventByDate(fdUtc, espnEvents, usedEspn);
+        const afEv = matchAfFixtureByDate(fdUtc, afEvents, usedAf);
+
+        const homeResolved = resolveBracketTeam(
+          m.homeTeam?.name ?? "TBD",
+          espnEv?.homeTeam,
+          afEv?.home,
+        );
+        const awayResolved = resolveBracketTeam(
+          m.awayTeam?.name ?? "TBD",
+          espnEv?.awayTeam,
+          afEv?.away,
+        );
+
+        let homeScore = m.score?.fullTime?.home ?? null;
+        let awayScore = m.score?.fullTime?.away ?? null;
+        let status = toStatus(m.status ?? "", fdUtc);
+
+        const sdbEv = homeResolved.en !== "TBD" && awayResolved.en !== "TBD"
+          ? sdbMap.get(sdbEventKey(homeResolved.en, awayResolved.en))
+          : undefined;
+
+        if (espnEv) {
+          if (homeScore === null) homeScore = espnEv.homeScore;
+          if (awayScore === null) awayScore = espnEv.awayScore;
+          if (espnEv.status === "LIVE" || espnEv.status === "FINISHED") status = espnEv.status;
+        }
+        if (afEv) {
+          if (homeScore === null) homeScore = afEv.homeScore;
+          if (awayScore === null) awayScore = afEv.awayScore;
+          if (afEv.status === "LIVE" || afEv.status === "FINISHED") status = afEv.status;
+        }
+        if (sdbEv) {
+          if (homeScore === null) homeScore = parseScore(sdbEv.intHomeScore);
+          if (awayScore === null) awayScore = parseScore(sdbEv.intAwayScore);
+        }
+
         const stageOrder = STAGE_ORDER[m.stage] ?? 99;
         return {
           id: `fd-${m.id}`,
           stage: STAGE_PT[m.stage] ?? m.stage,
           stageOrder,
-          date: m.utcDate ?? "",
-          homeTeam: homeEn === "TBD" ? "A definir" : (PT_NAME[canonical(homeEn)] ?? PT_NAME[homeEn] ?? homeEn),
-          homeFlag: FLAG[homeEn] ?? "🏳️",
-          awayTeam: awayEn === "TBD" ? "A definir" : (PT_NAME[canonical(awayEn)] ?? PT_NAME[awayEn] ?? awayEn),
-          awayFlag: FLAG[awayEn] ?? "🏳️",
-          homeScore: m.score?.fullTime?.home ?? null,
-          awayScore: m.score?.fullTime?.away ?? null,
-          status: toStatus(m.status ?? "", m.utcDate ?? ""),
+          date: fdUtc,
+          homeTeam: homeResolved.name,
+          homeFlag: homeResolved.flag,
+          awayTeam: awayResolved.name,
+          awayFlag: awayResolved.flag,
+          homeScore,
+          awayScore,
+          status,
         };
       })
       .sort((a, b) => a.stageOrder - b.stageOrder || new Date(a.date).getTime() - new Date(b.date).getTime())
@@ -2152,9 +2627,18 @@ router.get("/copa2026/match/:eventId/stats", async (req, res) => {
   const { eventId } = req.params;
   const now = Date.now();
   const finished = req.query.finished === "1" || req.query.finished === "true";
-  const homeQ = String(req.query.home ?? "");
-  const awayQ = String(req.query.away ?? "");
-  const dateQ = String(req.query.date ?? "").slice(0, 10);
+  let homeQ = String(req.query.home ?? "");
+  let awayQ = String(req.query.away ?? "");
+  let dateQ = String(req.query.date ?? "").slice(0, 10);
+
+  if ((!homeQ || !awayQ || !dateQ) && /^fd-\d+$/i.test(eventId)) {
+    const meta = await resolveMatchMeta(eventId);
+    if (meta) {
+      homeQ = homeQ || meta.homePt;
+      awayQ = awayQ || meta.awayPt;
+      dateQ = dateQ || meta.date;
+    }
+  }
 
   const cached = statsCacheMap.get(eventId);
   if (cached && now < cached.expiresAt) {

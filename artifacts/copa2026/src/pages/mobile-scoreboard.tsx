@@ -17,7 +17,7 @@ import {
   splitTodayAndOther,
 } from "@/lib/match-schedule";
 
-const GROUPS = ["Todos", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"];
+const GROUPS = ["Todos", "MM", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"];
 
 type Tab = "placares" | "grupos" | "artilheiros";
 
@@ -77,8 +77,9 @@ export default function MobileScoreboard() {
       refetchInterval: (query) => {
         const matches = query.state.data?.matches;
         const hasLive = Array.isArray(matches) && matches.some((m) => m.status === "LIVE");
-        return hasLive ? 10_000 : 30_000;
+        return hasLive ? 5_000 : 30_000;
       },
+      staleTime: 0,
     },
   });
 
@@ -124,7 +125,7 @@ export default function MobileScoreboard() {
   const data = liveApiData ?? cachedData;
   const isFallback =
     isError ||
-    apiData?.source === "cache" ||
+    apiData?.source === "static" ||
     (!liveApiData && !!cachedData);
 
   const handleRefresh = useCallback(async () => {
@@ -136,7 +137,11 @@ export default function MobileScoreboard() {
   const filteredMatches = useMemo(() => {
     if (!data?.matches) return [];
     return data.matches.filter((m) =>
-      activeGroup === "Todos" ? true : m.group === activeGroup
+      activeGroup === "Todos"
+        ? true
+        : activeGroup === "MM"
+          ? m.group === "Mata-mata"
+          : m.group === activeGroup
     );
   }, [data, activeGroup]);
 
@@ -241,7 +246,7 @@ export default function MobileScoreboard() {
                 boxShadow: activeGroup === g ? `0 0 14px ${C.gold}55` : "none",
               }}
             >
-              {g === "Todos" ? "Todos" : `Grupo ${g}`}
+              {g === "Todos" ? "Todos" : g === "MM" ? "Mata-mata" : `Grupo ${g}`}
             </button>
           ))}
         </div>

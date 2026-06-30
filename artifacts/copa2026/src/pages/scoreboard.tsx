@@ -23,7 +23,22 @@ type ExtendedMatch = Copa2026Match & { theSportsDbId?: string | null };
 
 type Tab = "placares" | "grupos" | "artilheiros" | "matamata";
 
-const GROUPS = ["Todos", "Grupo A", "Grupo B", "Grupo C", "Grupo D", "Grupo E", "Grupo F", "Grupo G", "Grupo H", "Grupo I", "Grupo J", "Grupo K", "Grupo L"];
+const GROUPS = [
+  "Todos",
+  "Mata-mata",
+  "Grupo A",
+  "Grupo B",
+  "Grupo C",
+  "Grupo D",
+  "Grupo E",
+  "Grupo F",
+  "Grupo G",
+  "Grupo H",
+  "Grupo I",
+  "Grupo J",
+  "Grupo K",
+  "Grupo L",
+];
 
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "placares", label: "Placares", icon: <Trophy className="w-4 h-4" /> },
@@ -54,8 +69,9 @@ export default function Scoreboard() {
       refetchInterval: (query) => {
         const matches = query.state.data?.matches;
         const hasLive = Array.isArray(matches) && matches.some((m) => m.status === "LIVE");
-        return hasLive ? 10_000 : 30_000;
+        return hasLive ? 5_000 : 30_000;
       },
+      staleTime: 0,
     }
   });
 
@@ -77,14 +93,16 @@ export default function Scoreboard() {
   const providers = (apiData as { providers?: string[] } | undefined)?.providers;
   const isFallback =
     isError ||
-    apiData?.source === "cache" ||
+    apiData?.source === "static" ||
     (!liveApiData && !!cachedData);
 
   const filteredMatches = useMemo(() => {
     if (!data?.matches) return [];
     return (data.matches as ExtendedMatch[]).filter((match) => {
       const matchesGroup =
-        activeGroup === "Todos" || match.group === activeGroup.replace("Grupo ", "");
+        activeGroup === "Todos" ||
+        (activeGroup === "Mata-mata" && match.group === "Mata-mata") ||
+        match.group === activeGroup.replace("Grupo ", "");
       const q = searchQuery.toLowerCase();
       const matchesSearch =
         !q ||
@@ -119,6 +137,12 @@ export default function Scoreboard() {
     setSelectedMatch(match);
     setDrawerOpen(true);
   }
+
+  useEffect(() => {
+    if (!drawerOpen || !selectedMatch?.id || !apiData?.matches?.length) return;
+    const fresh = (apiData.matches as ExtendedMatch[]).find((m) => m.id === selectedMatch.id);
+    if (fresh) setSelectedMatch(fresh);
+  }, [drawerOpen, selectedMatch?.id, apiData]);
 
   return (
     <div className="min-h-screen bg-background text-foreground pb-20">
